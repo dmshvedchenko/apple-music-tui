@@ -1,0 +1,18 @@
+{
+  "running": true,
+  "state": "playing",
+  "position": 12.5,
+  "volume": 80,
+  "muted": false,
+  "shuffle": true,
+  "repeat": "all",
+  "trackKey": "persistent:ABC",
+  "track": {
+    "persistentId": "ABC",
+    "name": "Quoted \"song\"\n第二行",
+    "artist": "Björk",
+    "album": "Álbum",
+    "duration": 180.25,
+    "favorited": true
+  }
+}

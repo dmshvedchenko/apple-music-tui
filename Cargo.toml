@@ -1,0 +1,27 @@
+[package]
+name = "apple-music-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A keyboard-first terminal interface for Apple Music"
+
+[dependencies]
+async-trait = "0.1.91"
+jsonwebtoken = { version = "11.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+rand = "0.9"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+
+[lints.rust]
+unsafe_code = "forbid"

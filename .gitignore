@@ -1,0 +1,8 @@
+/target/
+/.DS_Store
+/.env
+/.env.*
+*.log
+*.p8
+config.local.toml
+
