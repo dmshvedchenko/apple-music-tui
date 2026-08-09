@@ -8,3 +8,4 @@ AuthKey_*.p8
 *.key
 *.der
 config.local.toml
+prompts/
