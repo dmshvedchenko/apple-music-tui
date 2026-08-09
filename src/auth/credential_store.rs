@@ -1,7 +1,10 @@
 #[cfg(test)]
 use std::sync::Mutex;
 
-use super::{AuthError, KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE, SecretToken};
+use super::{AuthError, SecretToken};
+
+#[cfg(target_os = "macos")]
+use super::{KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
 
 pub trait CredentialStore {
     fn load(&self) -> Result<Option<SecretToken>, AuthError>;
