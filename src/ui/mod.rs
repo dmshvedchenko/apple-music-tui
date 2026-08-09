@@ -351,7 +351,15 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: Th
             theme,
         ))
         .style(Style::default().fg(theme.foreground));
-    frame.render_widget(list, area);
+    let selected_row = match state.sidebar_selection {
+        0..=2 => state.sidebar_selection,
+        3..=8 => state.sidebar_selection + 1,
+        9 => 11,
+        10 => 13,
+        _ => 0,
+    };
+    let mut list_state = ListState::default().with_selected(Some(selected_row));
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn sidebar_title(state: &AppState) -> &'static str {
@@ -880,6 +888,14 @@ fn render_library_songs(frame: &mut Frame<'_>, area: Rect, state: &AppState, the
         state.content_selection,
         rows[1].height,
         1,
+    );
+    tracing::debug!(
+        collection = "Songs",
+        selection = state.content_selection,
+        viewport_start = range.start,
+        visible_row = state.content_selection.saturating_sub(range.start),
+        generation = view.rebuild_count,
+        "collection viewport render"
     );
     let items = view
         .indices
@@ -1963,7 +1979,7 @@ fn render_backend_status(state: &AppState, theme: Theme) -> Paragraph<'_> {
             "Library: Refreshing…".to_owned()
         }
         CollectionLoadState::Refreshing { loaded, total } => {
-            format!("Library: Refreshing {loaded}/{total}")
+            format!("Library: Cached · Refreshing {loaded}/{total}")
         }
         CollectionLoadState::Loading { loaded, total } if *total == 0 => {
             "Library: discovering…".to_owned()

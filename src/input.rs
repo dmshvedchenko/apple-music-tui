@@ -501,6 +501,10 @@ mod tests {
             Some(Action::Pause)
         );
         assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Some(Action::ToggleShuffle)
+        );
+        assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE)),
             Some(Action::GoTo(Screen::Songs))
         );

@@ -72,7 +72,6 @@ enum PlaybackSessionSource {
         playlist_id: PlaylistId,
         complete: bool,
         known_source_len: usize,
-        shuffle_seed: Option<u64>,
     },
     Album {
         album_id: AlbumId,
@@ -91,6 +90,10 @@ struct PlaybackSession {
     source: PlaybackSessionSource,
     tracks: Vec<SessionTrack>,
     index: usize,
+    /// The confirmed Music.app shuffle mode committed to this synthesized session.
+    shuffle_enabled: bool,
+    /// One ordering seed per enabled shuffle cycle; polls must not reshuffle it.
+    shuffle_seed: Option<u64>,
     transition: Option<ExpectedTransition>,
     waiting_for_more: bool,
 }
@@ -121,6 +124,18 @@ impl PlaybackSession {
         match &self.source {
             PlaybackSessionSource::Playlist { complete, .. } => *complete,
             PlaybackSessionSource::Album { .. } => true,
+        }
+    }
+
+    fn next_index(&self, repeat: RepeatMode) -> Option<usize> {
+        if repeat == RepeatMode::One {
+            Some(self.index)
+        } else if self.index + 1 < self.tracks.len() {
+            Some(self.index + 1)
+        } else if self.source_is_complete() && repeat == RepeatMode::All {
+            Some(0)
+        } else {
+            None
         }
     }
 }
@@ -466,6 +481,7 @@ impl MacOsMusicBackend {
             Ok(raw) => {
                 let previous = self.snapshot.playback.clone();
                 self.apply_raw_playback(&raw);
+                self.reconcile_session_shuffle();
                 if let Err(failure) = self.reconcile_playback_session(&raw, &previous).await {
                     return self.session_failure_update(
                         "Failed to continue synthesized playback",
@@ -535,7 +551,7 @@ impl MacOsMusicBackend {
         album_id: AlbumId,
         track_ids: Vec<TrackId>,
     ) -> Result<(), BackendError> {
-        let tracks = track_ids
+        let mut tracks = track_ids
             .into_iter()
             .enumerate()
             .map(|(source_index, id)| {
@@ -549,10 +565,36 @@ impl MacOsMusicBackend {
         if tracks.is_empty() {
             return Err(BackendError::AlbumNotFound(album_id));
         }
+        let shuffle_enabled = self.snapshot.playback.shuffle;
+        let shuffle_seed = shuffle_enabled.then(|| {
+            let mut hasher = DefaultHasher::new();
+            album_id.hash(&mut hasher);
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut hasher);
+            hasher.finish()
+        });
+        if let Some(seed) = shuffle_seed {
+            let current = tracks.remove(0);
+            tracks.sort_by_key(|track| shuffled_track_rank(seed, track));
+            if tracks.len() > 1
+                && tracks
+                    .iter()
+                    .map(|track| track.source_index)
+                    .eq(1..tracks.len() + 1)
+            {
+                tracks.rotate_left(1);
+            }
+            tracks.insert(0, current);
+        }
         self.playback_session = Some(PlaybackSession {
             source: PlaybackSessionSource::Album { album_id },
             tracks,
             index: 0,
+            shuffle_enabled,
+            shuffle_seed,
             transition: None,
             waiting_for_more: false,
         });
@@ -605,10 +647,11 @@ impl MacOsMusicBackend {
                 playlist_id,
                 complete,
                 known_source_len,
-                shuffle_seed,
             },
             tracks,
             index: session_index,
+            shuffle_enabled: shuffle_seed.is_some(),
+            shuffle_seed,
             transition: None,
             waiting_for_more: false,
         });
@@ -638,7 +681,6 @@ impl MacOsMusicBackend {
             playlist_id: session_playlist_id,
             complete: session_complete,
             known_source_len,
-            shuffle_seed,
         } = &mut session.source
         else {
             return;
@@ -662,7 +704,12 @@ impl MacOsMusicBackend {
             .collect::<Vec<_>>();
         *known_source_len = playlist.tracks.len();
         *session_complete = complete;
-        if let Some(seed) = *shuffle_seed {
+        if session.shuffle_enabled {
+            let seed = session.shuffle_seed.unwrap_or_else(|| {
+                let seed = playlist_shuffle_seed(session_playlist_id);
+                session.shuffle_seed = Some(seed);
+                seed
+            });
             let tail_start = session.index.saturating_add(1);
             let mut tail = session
                 .tracks
@@ -676,26 +723,75 @@ impl MacOsMusicBackend {
         self.sync_playback_context();
     }
 
+    fn reconcile_session_shuffle(&mut self) {
+        let Some(session) = self.playback_session.as_mut() else {
+            return;
+        };
+        let shuffle_before = session.shuffle_enabled;
+        let tail_start = session.index.saturating_add(1).min(session.tracks.len());
+        let future_before = session.tracks[tail_start..]
+            .iter()
+            .map(|track| track.id.to_string())
+            .collect::<Vec<_>>();
+        let shuffle = self.snapshot.playback.shuffle;
+        if shuffle == shuffle_before {
+            tracing::debug!(shuffle, future_unchanged = true, "synthesized session poll");
+            return;
+        }
+        let mut tail = session.tracks.split_off(tail_start);
+        let original_tail = tail.clone();
+        if shuffle {
+            let seed = match &session.source {
+                PlaybackSessionSource::Playlist { playlist_id, .. } => {
+                    playlist_shuffle_seed(playlist_id)
+                }
+                PlaybackSessionSource::Album { album_id } => {
+                    let mut hasher = DefaultHasher::new();
+                    album_id.hash(&mut hasher);
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .hash(&mut hasher);
+                    hasher.finish()
+                }
+            };
+            session.shuffle_seed = Some(seed);
+            tail.sort_by_key(|track| shuffled_track_rank(seed, track));
+        } else {
+            session.shuffle_seed = None;
+            tail.sort_by_key(|track| track.source_index);
+        }
+        if shuffle && tail.len() > 1 && tail == original_tail {
+            tail.rotate_left(1);
+        }
+        session.tracks.extend(tail);
+        session.shuffle_enabled = shuffle;
+        tracing::debug!(
+            shuffle_before,
+            shuffle_after = shuffle,
+            current = %session.tracks[session.index].id,
+            history = ?session.tracks[..session.index].iter().map(|track| track.id.to_string()).collect::<Vec<_>>(),
+            future_before = ?future_before,
+            future_after = ?session.tracks[session.index.saturating_add(1)..].iter().map(|track| track.id.to_string()).collect::<Vec<_>>(),
+            "synthesized session shuffle toggle"
+        );
+        self.sync_playback_context();
+    }
+
     fn automatic_session_advance(&mut self) -> SessionAdvance {
         let Some(session) = self.playback_session.as_mut() else {
             return SessionAdvance::End;
         };
-        if self.snapshot.playback.repeat == RepeatMode::One {
-            return SessionAdvance::Play(session.index);
-        }
-        if session.index + 1 < session.tracks.len() {
-            return SessionAdvance::Play(session.index + 1);
+        if let Some(index) = session.next_index(self.snapshot.playback.repeat) {
+            return SessionAdvance::Play(index);
         }
         if !session.source_is_complete() {
             session.waiting_for_more = true;
             self.sync_playback_context();
             return SessionAdvance::WaitForMore;
         }
-        if self.snapshot.playback.repeat == RepeatMode::All {
-            SessionAdvance::Play(0)
-        } else {
-            SessionAdvance::End
-        }
+        SessionAdvance::End
     }
 
     async fn resume_waiting_session(&mut self) -> Result<(), BackendFailure> {
@@ -814,23 +910,10 @@ impl MacOsMusicBackend {
         &self,
     ) -> Option<(PlaylistId, TrackSelector, TrackSelector, usize)> {
         let session = self.playback_session.as_ref()?;
-        let PlaybackSessionSource::Playlist {
-            playlist_id,
-            complete,
-            ..
-        } = &session.source
-        else {
+        let PlaybackSessionSource::Playlist { playlist_id, .. } = &session.source else {
             return None;
         };
-        let target_index = if self.snapshot.playback.repeat == RepeatMode::One {
-            session.index
-        } else if session.index + 1 < session.tracks.len() {
-            session.index + 1
-        } else if *complete && self.snapshot.playback.repeat == RepeatMode::All {
-            0
-        } else {
-            return None;
-        };
+        let target_index = session.next_index(self.snapshot.playback.repeat)?;
         Some((
             playlist_id.clone(),
             session.tracks[session.index].selector.clone(),
@@ -870,6 +953,7 @@ impl MacOsMusicBackend {
                     session.waiting_for_more = false;
                 }
                 self.apply_raw_playback(&raw);
+                self.reconcile_session_shuffle();
                 if !raw.session_advanced
                     && let Err(failure) = self.reconcile_playback_session(&raw, &previous).await
                 {
@@ -908,7 +992,9 @@ impl MacOsMusicBackend {
         self.snapshot.playlist_status = CollectionLoadState::Loaded {
             total: playlists.len(),
         };
-        self.snapshot.library.clear();
+        if !self.has_cached_library {
+            self.snapshot.library.clear();
+        }
         self.snapshot.library_status = if self.has_cached_library {
             CollectionLoadState::Refreshing {
                 loaded: 0,
@@ -1379,7 +1465,29 @@ impl MusicBackend for MacOsMusicBackend {
                 });
             }
             BackendCommand::PlayPlaylist(playlist_id) => {
-                self.cancel_playback_session("native playlist playback was selected");
+                self.cancel_playback_session("a new playlist playback context was selected");
+                if let Some(playlist) = self
+                    .snapshot
+                    .playlists
+                    .iter()
+                    .find(|playlist| playlist.id == playlist_id)
+                    .filter(|playlist| !playlist.tracks.is_empty())
+                {
+                    let track_ids = playlist
+                        .tracks
+                        .iter()
+                        .map(|track| track.id.clone())
+                        .collect::<Vec<_>>();
+                    let complete = playlist.contents_state.is_complete();
+                    self.create_playlist_session(playlist_id, track_ids, 0, complete)?;
+                    return Ok(match self.play_session_index(0).await {
+                        Ok(()) => self.playback_update(),
+                        Err(failure) => self.session_failure_update(
+                            "Failed to start synthesized playlist playback",
+                            failure,
+                        ),
+                    });
+                }
                 let Some(persistent_id) = persistent_playlist_selector(&playlist_id) else {
                     return Err(BackendError::PlaylistNotFound(playlist_id));
                 };
@@ -1494,14 +1602,13 @@ impl MusicBackend for MacOsMusicBackend {
             }
             BackendCommand::Next => {
                 if let Some(session) = &self.playback_session {
-                    let next = if session.index + 1 < session.tracks.len() {
-                        Some(session.index + 1)
-                    } else if self.snapshot.playback.repeat == RepeatMode::All {
-                        Some(0)
-                    } else {
-                        None
-                    };
+                    let next = session.next_index(self.snapshot.playback.repeat);
                     if let Some(next) = next {
+                        tracing::debug!(
+                            next = %session.tracks[next].id,
+                            source = "session",
+                            "synthesized manual advance"
+                        );
                         return Ok(match self.play_session_index(next).await {
                             Ok(()) => self.playback_update(),
                             Err(failure) => self.session_failure_update(
@@ -1550,21 +1657,17 @@ impl MusicBackend for MacOsMusicBackend {
                 return Err(BackendError::Unsupported(Capability::Mute));
             }
             BackendCommand::ToggleShuffle => {
-                let had_session = self.playback_session.is_some();
-                self.cancel_playback_session(
-                    "shuffle changed; restart the collection to capture the new order",
-                );
-                let update = self
-                    .run_playback_command(ScriptRequest::ToggleShuffle)
+                let shuffle_before = self.snapshot.playback.shuffle;
+                self.run_playback_command(ScriptRequest::ToggleShuffle)
                     .await;
-                if had_session {
-                    return Ok(BackendUpdate::Notice {
-                        availability: self.snapshot.availability.clone(),
-                        playback: self.snapshot.playback.clone(),
-                        message: "Shuffle changed; restart playlist or album playback to apply the new synthesized order".to_owned(),
-                    });
-                }
-                return Ok(update);
+                self.reconcile_session_shuffle();
+                tracing::debug!(
+                    session_active = self.playback_session.is_some(),
+                    shuffle_before,
+                    shuffle_after = self.snapshot.playback.shuffle,
+                    "Music.app shuffle command reconciled"
+                );
+                return Ok(self.playback_update());
             }
             BackendCommand::CycleRepeat => ScriptRequest::CycleRepeat,
             BackendCommand::ToggleFavoriteCurrent => {
@@ -1956,6 +2059,63 @@ mod tests {
                 .expect("script response");
             assert_eq!(request, expected);
             Ok(response)
+        }
+    }
+
+    struct TransitionRecordingRunner {
+        requests: Mutex<Vec<ScriptRequest>>,
+        current_id: Mutex<String>,
+        shuffle: Mutex<bool>,
+    }
+
+    impl TransitionRecordingRunner {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                current_id: Mutex::new(String::new()),
+                shuffle: Mutex::new(false),
+            }
+        }
+    }
+
+    impl AutomationRunner for TransitionRecordingRunner {
+        fn is_installed(&self) -> bool {
+            true
+        }
+
+        fn run(&self, request: ScriptRequest) -> Result<String, AutomationError> {
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push(request.clone());
+            let track = match &request {
+                ScriptRequest::PlayPlaylistTrackOnce { track, .. }
+                | ScriptRequest::PollPlaylistTransition { target: track, .. } => track,
+                ScriptRequest::ToggleShuffle => {
+                    let mut shuffle = self.shuffle.lock().expect("shuffle lock");
+                    *shuffle = !*shuffle;
+                    let current = self.current_id.lock().expect("current lock").clone();
+                    return Ok(format!(
+                        r#"{{"running":true,"state":"playing","position":0,"volume":50,"shuffle":{shuffle},"track":{{"persistentId":"{current}","name":"{current}","artist":"Artist","album":"Playlist","duration":60}}}}"#
+                    ));
+                }
+                ScriptRequest::Poll => {
+                    let current = self.current_id.lock().expect("current lock").clone();
+                    let shuffle = *self.shuffle.lock().expect("shuffle lock");
+                    return Ok(format!(
+                        r#"{{"running":true,"state":"playing","position":1,"volume":50,"shuffle":{shuffle},"track":{{"persistentId":"{current}","name":"{current}","artist":"Artist","album":"Playlist","duration":60}}}}"#
+                    ));
+                }
+                _ => panic!("unexpected transition test request: {request:?}"),
+            };
+            let id = match track {
+                TrackSelector::PersistentId(id) | TrackSelector::DatabaseId(id) => id.clone(),
+            };
+            *self.current_id.lock().expect("current lock") = id.clone();
+            let shuffle = *self.shuffle.lock().expect("shuffle lock");
+            Ok(format!(
+                r#"{{"running":true,"state":"playing","position":0,"volume":50,"shuffle":{shuffle},"sessionAdvanced":true,"track":{{"persistentId":"{id}","name":"{id}","artist":"Artist","album":"Playlist","duration":60}}}}"#
+            ))
         }
     }
 
@@ -2423,6 +2583,198 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn natural_playlist_transition_uses_the_reconciled_shuffle_future() {
+        let runner = Arc::new(TransitionRecordingRunner::new());
+        let runner_for_backend: Arc<dyn AutomationRunner> = runner.clone();
+        let mut backend = MacOsMusicBackend::with_runner(runner_for_backend, true);
+        let playlist_id = PlaylistId::new("musicapp:playlist:persistent:P");
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id,
+                ordered_track_ids: ["A", "B", "C", "D", "E"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                selected_index: 1,
+                complete: true,
+            })
+            .await
+            .expect("start playlist at B");
+
+        backend.snapshot.playback.shuffle = true;
+        backend.reconcile_session_shuffle();
+        let expected = {
+            let session = backend.playback_session.as_ref().expect("shuffled session");
+            session.tracks[session.index + 1].selector.clone()
+        };
+
+        backend.snapshot.playback.position = Duration::from_secs(59);
+        backend
+            .tick(Duration::ZERO)
+            .await
+            .expect("near-end transition")
+            .expect("transition update");
+
+        let requests = runner.requests.lock().expect("request lock");
+        let transition = requests
+            .iter()
+            .find_map(|request| match request {
+                ScriptRequest::PollPlaylistTransition { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("natural transition request");
+        assert_eq!(transition, &expected);
+        assert_eq!(
+            backend
+                .snapshot
+                .playback
+                .current_track
+                .as_ref()
+                .expect("shuffled successor")
+                .id,
+            TrackId::new(match expected {
+                TrackSelector::PersistentId(id) => format!("musicapp:persistent:{id}"),
+                TrackSelector::DatabaseId(id) => format!("musicapp:database:{id}"),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_shuffle_toggle_commits_future_for_manual_next_and_polls() {
+        let runner = Arc::new(TransitionRecordingRunner::new());
+        let runner_for_backend: Arc<dyn AutomationRunner> = runner.clone();
+        let mut backend = MacOsMusicBackend::with_runner(runner_for_backend, true);
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: ["A", "B", "C", "D", "E", "F"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                selected_index: 1,
+                complete: true,
+            })
+            .await
+            .expect("start B");
+        let current_before = backend.snapshot.playback.current_track.clone();
+
+        backend
+            .execute(BackendCommand::ToggleShuffle)
+            .await
+            .expect("toggle shuffle");
+        let (future_after_toggle, next_index) = {
+            let session = backend.playback_session.as_ref().expect("active session");
+            assert!(session.shuffle_enabled);
+            (
+                session.tracks[session.index + 1..]
+                    .iter()
+                    .map(|track| track.id.clone())
+                    .collect::<Vec<_>>(),
+                session
+                    .next_index(backend.snapshot.playback.repeat)
+                    .expect("shuffled successor"),
+            )
+        };
+        assert_ne!(
+            future_after_toggle,
+            ["C", "D", "E", "F"]
+                .into_iter()
+                .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(backend.snapshot.playback.current_track, current_before);
+
+        backend.poll().await;
+        assert_eq!(
+            backend
+                .playback_session
+                .as_ref()
+                .expect("session survives poll")
+                .tracks
+                .iter()
+                .skip(2)
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>(),
+            future_after_toggle
+        );
+
+        backend
+            .execute(BackendCommand::Next)
+            .await
+            .expect("manual session next");
+        let requests = runner.requests.lock().expect("request lock");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| matches!(request, ScriptRequest::Next)),
+            "an active synthesized session must not issue native nextTrack"
+        );
+        assert!(requests.iter().any(|request| {
+            matches!(request, ScriptRequest::PlayPlaylistTrackOnce { track, .. }
+                if *track == backend.playback_session.as_ref().expect("session").tracks[next_index].selector)
+        }));
+    }
+
+    #[tokio::test]
+    async fn disabling_shuffle_keeps_consumed_history_and_restores_canonical_future() {
+        let runner = Arc::new(TransitionRecordingRunner::new());
+        let runner_for_backend: Arc<dyn AutomationRunner> = runner;
+        let mut backend = MacOsMusicBackend::with_runner(runner_for_backend, true);
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: ["A", "B", "C", "D", "E", "F"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                selected_index: 1,
+                complete: true,
+            })
+            .await
+            .expect("start B");
+        backend
+            .execute(BackendCommand::ToggleShuffle)
+            .await
+            .expect("enable shuffle");
+        backend
+            .execute(BackendCommand::Next)
+            .await
+            .expect("consume one shuffled track");
+        let consumed = backend.playback_session.as_ref().expect("session").tracks[..=2]
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+
+        backend
+            .execute(BackendCommand::ToggleShuffle)
+            .await
+            .expect("disable shuffle");
+        let session = backend
+            .playback_session
+            .as_ref()
+            .expect("session remains active");
+        assert!(!session.shuffle_enabled);
+        assert_eq!(
+            session.tracks[..=session.index]
+                .iter()
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>(),
+            consumed
+        );
+        assert!(
+            session.tracks[session.index + 1..]
+                .windows(2)
+                .all(|pair| pair[0].source_index < pair[1].source_index),
+            "only the remaining future returns to canonical source order"
+        );
+        assert!(
+            session.tracks[session.index + 1..]
+                .iter()
+                .all(|track| !consumed.contains(&track.id))
+        );
     }
 
     #[tokio::test]

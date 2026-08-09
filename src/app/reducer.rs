@@ -1752,6 +1752,9 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             recently_played,
         }) => {
             let reducer_started = std::time::Instant::now();
+            let selected_before = active_collection(state)
+                .and_then(|collection| selected_collection_identity(state, collection));
+            let selection_before = state.content_selection;
             apply_playback_update(state, availability, playback);
             let refreshing_cached_library = matches!(
                 state.library_status,
@@ -1801,17 +1804,26 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
                     "local search index construction timing"
                 );
             }
-            rebuild_library_views(state);
+            if !refreshing_cached_library || complete {
+                rebuild_library_views(state);
+            }
             refresh_search(state);
             state.view_status = if state.library.is_empty() && complete {
                 ViewStatus::Empty
             } else {
                 ViewStatus::Loaded
             };
-            clamp_selections(state);
+            if !refreshing_cached_library || complete {
+                clamp_selections(state);
+            }
             tracing::debug!(
                 loaded,
                 complete,
+                selection_before,
+                selection_after = state.content_selection,
+                selected_before = ?selected_before,
+                selected_after = ?active_collection(state).and_then(|collection| selected_collection_identity(state, collection)),
+                presented_songs_generation = state.library_views.songs.rebuild_count,
                 reducer_merge_ms = reducer_started.elapsed().as_secs_f64() * 1_000.0,
                 "local library reducer timing"
             );
@@ -2300,9 +2312,14 @@ fn refresh_search(state: &mut AppState) {
             .map(|entry| entry.result.clone())
             .collect()
     };
-    state.content_selection = state
-        .content_selection
-        .min(state.search_results.len().saturating_sub(1));
+    // `content_selection` is shared by every content screen.  Library batches refresh this
+    // index so cached search remains immediately useful, but an inactive (usually empty)
+    // search result set must never clamp the selection in Songs/Albums/Artists.
+    if matches!(state.navigation.active, Route::Section(Screen::Search)) {
+        state.content_selection = state
+            .content_selection
+            .min(state.search_results.len().saturating_sub(1));
+    }
 }
 
 fn rebuild_search_index(state: &mut AppState) {
@@ -2423,7 +2440,7 @@ mod tests {
     use super::{
         content_length, insert_artwork_cache, insert_renderable_artwork_cache,
         rebuild_collection_view, rebuild_library_views, rebuild_search_index, reduce,
-        refresh_search,
+        refresh_search, selected_collection_identity,
     };
 
     #[test]
@@ -3585,6 +3602,78 @@ mod tests {
         );
         assert_eq!(state.library_views.songs.indices, vec![1, 0]);
         assert_eq!(state.library_views.songs.filter, "artist");
+    }
+
+    #[test]
+    fn cached_refresh_batches_do_not_clamp_active_collection_navigation() {
+        let tracks = ["A", "B", "C", "D", "E"]
+            .into_iter()
+            .map(|id| Track::new(id, id, "Artist", "Album", Duration::from_secs(1)))
+            .collect::<Vec<_>>();
+        let mut state = AppState {
+            navigation: crate::app::state::NavigationState {
+                active: Route::Section(Screen::Songs),
+                history: Vec::new(),
+            },
+            focus: Focus::Content,
+            library: tracks.clone(),
+            library_status: crate::domain::CollectionLoadState::Cached {
+                total: tracks.len(),
+            },
+            ..AppState::default()
+        };
+        state.library_views.songs.sort = CollectionSort::SongTitle;
+        rebuild_library_views(&mut state);
+        let presented_generation = state.library_views.songs.rebuild_count;
+
+        for (action, expected_id) in [
+            (Action::MoveDown, "B"),
+            (Action::MoveDown, "C"),
+            (Action::MoveUp, "B"),
+            (Action::MoveDown, "C"),
+        ] {
+            reduce(&mut state, action);
+            let selected_before = selected_collection_identity(&state, CollectionKind::Songs)
+                .expect("selected cached song");
+            assert_eq!(selected_before, expected_id);
+            reduce(
+                &mut state,
+                Action::Backend(Box::new(BackendEvent::Update(
+                    BackendUpdate::LibraryBatch {
+                        availability: crate::domain::BackendAvailability::Available,
+                        playback: PlaybackSnapshot::default(),
+                        tracks: vec![Track::new(
+                            "incoming",
+                            "Incoming",
+                            "Artist",
+                            "Album",
+                            Duration::from_secs(1),
+                        )],
+                        authoritative_tracks: None,
+                        loaded: 1,
+                        total: 6,
+                        complete: false,
+                        artists: Vec::new(),
+                        albums: Vec::new(),
+                        recently_added: Vec::new(),
+                        recently_played: Vec::new(),
+                    },
+                ))),
+            );
+            assert_eq!(
+                selected_collection_identity(&state, CollectionKind::Songs),
+                Some(selected_before)
+            );
+            assert_eq!(
+                state.library_views.songs.rebuild_count,
+                presented_generation
+            );
+            assert_eq!(
+                state.library_views.songs.indices.len(),
+                tracks.len(),
+                "partial refresh must not alter displayed cached order"
+            );
+        }
     }
 
     #[test]

@@ -106,7 +106,9 @@ impl ScriptRequest {
                      const finalMatches = !finalHasIdentity || ({expected_is_persistent}\n\
                          ? finalPersistentId === {expected_value}\n\
                          : finalDatabaseId === {expected_value});\n\
-                     if (finalTransitionState === 'stopped' && finalMatches) {{\n\
+                     const finalPosition = Number(safe(() => music.playerPosition()) || 0);\n\
+                     const nativeContinuation = !finalMatches && finalTransitionState === 'playing' && finalPosition <= 1.5;\n\
+                     if ((finalTransitionState === 'stopped' && finalMatches) || nativeContinuation) {{\n\
                          const transitionPlaylists = music.playlists.whose({{persistentID: {playlist_persistent_id}}})();\n\
                          if (transitionPlaylists.length === 0) throw new Error('Playlist continuation source is no longer available');\n\
                          const transitionTargets = transitionPlaylists[0].tracks.whose({{{target_property}: {target_value}}})();\n\
@@ -595,6 +597,8 @@ mod tests {
         assert!(transition.contains(r#"databaseID: "42\"; malicious()""#));
         assert!(transition.contains("Date.now() + 2000"));
         assert!(transition.contains("delay(0.05)"));
+        assert!(transition.contains("const nativeContinuation = !finalMatches"));
+        assert!(transition.contains("finalPosition <= 1.5"));
         assert!(transition.contains("result.sessionAdvanced = true"));
 
         let removal = build_script(&ScriptRequest::RemovePlaylistTrack {
