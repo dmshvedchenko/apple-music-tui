@@ -9,5 +9,4 @@ AuthKey_*.p8
 *.der
 config.local.toml
 prompts/
-prompts/
 CLAUDE.md
