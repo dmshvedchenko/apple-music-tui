@@ -2844,6 +2844,38 @@ mod tests {
     }
 
     #[test]
+    fn full_now_playing_renders_the_reconciled_collection_position() {
+        let ordered_track_ids = (1..=100)
+            .map(|index| TrackId::new(format!("track-{index}")))
+            .collect::<Vec<_>>();
+        let state = AppState {
+            navigation: NavigationState {
+                active: Route::NowPlaying,
+                history: Vec::new(),
+            },
+            playback: PlaybackSnapshot {
+                current_track: Some(Track::new(
+                    "track-37",
+                    "Thirty Seven",
+                    "Artist",
+                    "Album",
+                    Duration::from_secs(60),
+                )),
+                context: PlaybackContext::Playlist {
+                    playlist_id: PlaylistId::new("playlist"),
+                    ordered_track_ids,
+                    current_index: 36,
+                    complete: true,
+                },
+                ..PlaybackSnapshot::default()
+            },
+            ..AppState::default()
+        };
+
+        assert!(render_text_at(&state, 110, 32).contains("Playlist · 37 / 100"));
+    }
+
+    #[test]
     fn full_now_playing_idle_and_help_are_clean_and_specific() {
         let state = AppState {
             navigation: NavigationState {

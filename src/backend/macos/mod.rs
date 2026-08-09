@@ -341,6 +341,7 @@ impl MacOsMusicBackend {
         self.track_key = identity;
         self.snapshot.availability = availability;
         self.snapshot.playback = playback;
+        self.reconcile_session_current_track();
         self.sync_playback_context();
         if self.snapshot.playback.status != previous_status {
             tracing::debug!(
@@ -385,6 +386,43 @@ impl MacOsMusicBackend {
             .playback_session
             .as_ref()
             .map_or(PlaybackContext::NoContext, PlaybackSession::context);
+    }
+
+    /// Reconcile only the cursor of an existing synthesized session with Music.app.
+    /// The ordered vector remains backend-owned; a current track outside that vector is left for
+    /// normal external-change handling to cancel rather than recreate the session.
+    fn reconcile_session_current_track(&mut self) {
+        let Some(current_track) = self.snapshot.playback.current_track.as_ref() else {
+            return;
+        };
+        let Some(session) = self.playback_session.as_mut() else {
+            return;
+        };
+        if let Some(transition) = &session.transition {
+            // During an exact-track command Music.app can briefly report the previous source
+            // track.  Its prepared session index remains authoritative until the transition
+            // target is observed or the regular transition reconciliation decides otherwise.
+            if track_selector(&current_track.id).is_ok_and(|selector| selector != transition.to) {
+                return;
+            }
+        }
+        let Some(index) = session
+            .tracks
+            .iter()
+            .position(|track| track.id == current_track.id)
+        else {
+            return;
+        };
+        if session.index != index {
+            tracing::debug!(
+                previous_index = session.index,
+                current_index = index,
+                track_id = %current_track.id,
+                "synthesized session position reconciled from Music.app"
+            );
+            session.index = index;
+            session.waiting_for_more = false;
+        }
     }
 
     fn cancel_playback_session(&mut self, reason: &str) {
@@ -2817,6 +2855,91 @@ mod tests {
                 .id,
             TrackId::new("musicapp:persistent:OTHER")
         );
+    }
+
+    #[tokio::test]
+    async fn music_app_track_change_within_session_reconciles_playlist_position() {
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([
+            (
+                ScriptRequest::PlayPlaylistTrackOnce {
+                    playlist_persistent_id: "P".to_owned(),
+                    track: TrackSelector::PersistentId("T2".to_owned()),
+                },
+                r#"{"running":true,"state":"playing","position":0,"volume":50,"track":{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}"#,
+            ),
+            (
+                ScriptRequest::Poll,
+                r#"{"running":true,"state":"playing","position":12,"volume":50,"track":{"persistentId":"T4","name":"Four","artist":"Artist","album":"Playlist","duration":60}}"#,
+            ),
+        ]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: ["T1", "T2", "T3", "T4"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                selected_index: 1,
+                complete: true,
+            })
+            .await
+            .expect("start middle playlist track");
+        backend.poll().await;
+
+        assert!(matches!(
+            backend.snapshot.playback.context,
+            PlaybackContext::Playlist {
+                current_index: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn session_position_reconciliation_keeps_shuffled_order_intact() {
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+        let playlist_id = PlaylistId::new("musicapp:playlist:persistent:P");
+        backend.snapshot.playback.shuffle = true;
+        backend
+            .create_playlist_session(
+                playlist_id,
+                ["A", "B", "C", "D", "E"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                0,
+                true,
+            )
+            .expect("create shuffled session");
+        let ordered_before = backend
+            .playback_session
+            .as_ref()
+            .expect("session")
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let target = ordered_before[3].clone();
+        let raw = parse_output(&format!(
+            r#"{{"running":true,"state":"playing","position":10,"volume":50,"shuffle":true,"track":{{"persistentId":"{}","name":"Target","artist":"Artist","album":"Playlist","duration":60}}}}"#,
+            target.as_str().trim_start_matches("musicapp:persistent:")
+        ))
+        .expect("Music.app state");
+        backend.apply_raw_playback(&raw);
+
+        let session = backend.playback_session.as_ref().expect("session");
+        assert_eq!(
+            session
+                .tracks
+                .iter()
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>(),
+            ordered_before
+        );
+        assert_eq!(session.index, 3);
+        assert!(session.shuffle_enabled);
     }
 
     #[tokio::test]
