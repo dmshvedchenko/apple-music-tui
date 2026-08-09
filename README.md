@@ -248,8 +248,7 @@ MIT
 
 ### Music.app permission
 
-Enable Automation permission for the application that launches the
-terminal:
+Enable Automation permission for the application that launches `apple-music-tui`:
 
 System Settings → Privacy & Security → Automation
 
@@ -258,7 +257,6 @@ Possible hosts:
 - Terminal
 - iTerm2
 - Ghostty
-- Codex
 
 ### Music.app is not running
 
