@@ -10,3 +10,4 @@ AuthKey_*.p8
 config.local.toml
 prompts/
 prompts/
+CLAUDE.md
