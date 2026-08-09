@@ -9,25 +9,43 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::domain::{
-    Album, Artist, BackendAvailability, BackendSnapshot, PlaybackSnapshot, Playlist, PlaylistId,
-    Track, TrackId,
+    Album, AlbumId, Artist, ArtworkKey, ArtworkResult, BackendAvailability, BackendSnapshot,
+    PlaybackSnapshot, Playlist, PlaylistId, RecentlyPlayedEntry, Track, TrackId,
 };
 
 use self::capabilities::{Capabilities, Capability};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendCommand {
+    /// Starts a new bounded authoritative Music.app library scan when no scan is active.
+    RefreshLibrary,
     OpenPlayer,
     Play,
     Pause,
+    Stop,
     PlayPause,
     PlayTrack(TrackId),
     PlayPlaylistTrack {
         playlist_id: PlaylistId,
-        track_id: TrackId,
+        ordered_track_ids: Vec<TrackId>,
+        selected_index: usize,
+        complete: bool,
     },
     PlayPlaylist(PlaylistId),
+    PlayAlbum {
+        album_id: AlbumId,
+        track_ids: Vec<TrackId>,
+    },
+    LoadTrackArtwork {
+        key: ArtworkKey,
+        track_id: TrackId,
+    },
     LoadPlaylist(PlaylistId),
+    RemovePlaylistTrack {
+        playlist_id: PlaylistId,
+        index: usize,
+        expected_track_id: TrackId,
+    },
     Next,
     Previous,
     SeekBy(i64),
@@ -46,6 +64,15 @@ pub enum BackendCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendUpdate {
+    LibraryRefreshStarted {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+    },
+    LibraryRefreshFailed {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        message: String,
+    },
     Snapshot(BackendSnapshot),
     Playback {
         availability: BackendAvailability,
@@ -60,12 +87,14 @@ pub enum BackendUpdate {
         availability: BackendAvailability,
         playback: PlaybackSnapshot,
         tracks: Vec<Track>,
+        authoritative_tracks: Option<Vec<Track>>,
         loaded: usize,
         total: usize,
         complete: bool,
         artists: Vec<Artist>,
         albums: Vec<Album>,
         recently_added: Vec<Album>,
+        recently_played: Vec<RecentlyPlayedEntry>,
     },
     PlaylistBatch {
         availability: BackendAvailability,
@@ -75,6 +104,39 @@ pub enum BackendUpdate {
         loaded: usize,
         total: usize,
         complete: bool,
+    },
+    PlaylistLoadFailed {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        playlist_id: PlaylistId,
+        message: String,
+    },
+    PlaylistTrackRemoved {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        playlist_id: PlaylistId,
+        index: usize,
+        expected_track_id: TrackId,
+    },
+    Stopped {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+    },
+    PlaybackContextFailed {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        message: String,
+    },
+    Notice {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        message: String,
+    },
+    Artwork {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        key: ArtworkKey,
+        result: ArtworkResult,
     },
 }
 
@@ -103,8 +165,14 @@ pub enum BackendError {
     #[error("playlist '{0}' is not available")]
     PlaylistNotFound(PlaylistId),
 
+    #[error("album '{0}' is not available")]
+    AlbumNotFound(AlbumId),
+
     #[error("queue index {index} is out of bounds for length {length}")]
     QueueIndex { index: usize, length: usize },
+
+    #[error("{0}")]
+    OperationFailed(String),
 }
 
 #[async_trait]
@@ -162,7 +230,6 @@ pub fn spawn_worker<B: MusicBackend>(
             .clamp(Duration::from_millis(250), Duration::from_millis(1_000));
         let mut ticker = tokio::time::interval(tick_rate);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await;
         tracing::debug!(
             backend = backend.name(),
             interval_ms = tick_rate.as_millis(),
@@ -171,6 +238,7 @@ pub fn spawn_worker<B: MusicBackend>(
 
         loop {
             tokio::select! {
+                biased;
                 command = commands.recv() => {
                     let Some(command) = command else {
                         break;

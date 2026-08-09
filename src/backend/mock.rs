@@ -3,8 +3,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::domain::{
-    Album, Artist, BackendAvailability, BackendSnapshot, CollectionLoadState, PlaybackSnapshot,
-    PlaybackStatus, Playlist, PlaylistId, QueueItem, RepeatMode, Station, Track, TrackId,
+    Album, Artist, ArtworkResult, BackendAvailability, BackendSnapshot, CollectionLoadState,
+    PlaybackContext, PlaybackSnapshot, PlaybackStatus, Playlist, PlaylistId, QueueItem,
+    RecentlyPlayedEntry, RepeatMode, Station, Track, TrackId,
 };
 
 use super::{
@@ -27,7 +28,7 @@ pub struct MockMusicBackend {
 impl MockMusicBackend {
     #[must_use]
     pub fn new() -> Self {
-        let library = vec![
+        let mut library = vec![
             Track::new(
                 "mock-001",
                 "Midnight Terminal",
@@ -71,6 +72,10 @@ impl MockMusicBackend {
                 Duration::from_secs(182),
             ),
         ];
+        library[0].metadata.last_played_date = Some("2026-08-03T18:30:00.000Z".to_owned());
+        library[0].metadata.play_count = Some(12);
+        library[1].metadata.last_played_date = Some("2026-08-02T09:15:00.000Z".to_owned());
+        library[1].metadata.play_count = Some(4);
         let queue = library
             .iter()
             .cloned()
@@ -140,6 +145,21 @@ impl MockMusicBackend {
                 "A demo mix of alternative catalog tracks.",
             ),
         ];
+        let folder_id = PlaylistId::new("mock-playlist-folder-work");
+        let mut folder = Playlist::new(
+            folder_id.to_string(),
+            "Work",
+            Some("A mock folder for hierarchy and expansion tests.".to_owned()),
+            Vec::new(),
+        );
+        folder.kind = crate::domain::PlaylistKind::Folder;
+        let mut nested_duplicate = Playlist::new(
+            "mock-playlist-nested-terminal-focus",
+            "Terminal Focus",
+            Some("A duplicate name nested under the Work folder.".to_owned()),
+            vec![library[0].clone(), library[4].clone()],
+        );
+        nested_duplicate.parent_id = Some(folder_id);
         let playlists = vec![
             Playlist::new(
                 "mock-playlist-terminal-focus",
@@ -159,6 +179,8 @@ impl MockMusicBackend {
                 None,
                 library.clone(),
             ),
+            folder,
+            nested_duplicate,
         ];
         let playback = PlaybackSnapshot {
             current_entry_id: queue.first().map(|item| item.id.clone()),
@@ -180,6 +202,23 @@ impl MockMusicBackend {
     }
 
     fn snapshot_value(&self) -> BackendSnapshot {
+        let recently_played = self
+            .library
+            .iter()
+            .filter_map(|track| {
+                track
+                    .metadata
+                    .last_played_date
+                    .clone()
+                    .map(|played_at| RecentlyPlayedEntry {
+                        track_id: track.id.clone(),
+                        title: track.title.clone(),
+                        artist: track.artist.clone(),
+                        play_count: track.metadata.play_count,
+                        played_at,
+                    })
+            })
+            .collect();
         BackendSnapshot {
             availability: BackendAvailability::Available,
             playback: self.playback.clone(),
@@ -188,6 +227,7 @@ impl MockMusicBackend {
             artists: self.artists.clone(),
             albums: self.albums.clone(),
             recently_added: self.albums.clone(),
+            recently_played,
             stations: self.stations.clone(),
             playlists: self.playlists.clone(),
             library_status: CollectionLoadState::Loaded {
@@ -216,6 +256,13 @@ impl MockMusicBackend {
             .queue
             .get(self.current_index)
             .map(|item| item.track.clone());
+        match &mut self.playback.context {
+            PlaybackContext::Playlist { current_index, .. }
+            | PlaybackContext::Album { current_index, .. } => {
+                *current_index = self.current_index;
+            }
+            PlaybackContext::NoContext => {}
+        }
     }
 
     fn next_track(&mut self, automatic: bool) -> Result<(), BackendError> {
@@ -232,6 +279,7 @@ impl MockMusicBackend {
             self.current_index = 0;
         } else {
             self.playback.status = PlaybackStatus::Stopped;
+            self.playback.context = PlaybackContext::NoContext;
         }
         self.playback.position = Duration::ZERO;
         self.select_current();
@@ -247,6 +295,7 @@ impl MockMusicBackend {
     }
 
     fn play_track(&mut self, track_id: &TrackId) -> Result<(), BackendError> {
+        self.playback.context = PlaybackContext::NoContext;
         let index = self
             .queue
             .iter()
@@ -266,6 +315,11 @@ impl MockMusicBackend {
             .find(|playlist| playlist.id == *playlist_id)
             .cloned()
             .ok_or_else(|| BackendError::PlaylistNotFound(playlist_id.clone()))?;
+        let ordered_track_ids = playlist
+            .tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
         self.queue = playlist
             .tracks
             .into_iter()
@@ -275,6 +329,94 @@ impl MockMusicBackend {
         self.current_index = 0;
         self.playback.position = Duration::ZERO;
         self.playback.status = PlaybackStatus::Playing;
+        self.playback.context = PlaybackContext::Playlist {
+            playlist_id: playlist_id.clone(),
+            ordered_track_ids,
+            current_index: 0,
+            complete: true,
+        };
+        self.select_current();
+        Ok(())
+    }
+
+    fn play_playlist_track(
+        &mut self,
+        playlist_id: &PlaylistId,
+        ordered_track_ids: &[TrackId],
+        selected_index: usize,
+        complete: bool,
+    ) -> Result<(), BackendError> {
+        let playlist = self
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == *playlist_id)
+            .ok_or_else(|| BackendError::PlaylistNotFound(playlist_id.clone()))?;
+        let tracks = ordered_track_ids
+            .iter()
+            .map(|track_id| {
+                playlist
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == *track_id)
+                    .cloned()
+                    .ok_or_else(|| BackendError::TrackNotFound(track_id.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if selected_index >= tracks.len() {
+            return Err(BackendError::PlaylistNotFound(playlist_id.clone()));
+        }
+        self.queue = tracks
+            .into_iter()
+            .enumerate()
+            .map(|(index, track)| QueueItem::new(format!("mock-playlist-{index:03}"), track))
+            .collect();
+        self.current_index = selected_index;
+        self.playback.position = Duration::ZERO;
+        self.playback.status = PlaybackStatus::Playing;
+        self.playback.context = PlaybackContext::Playlist {
+            playlist_id: playlist_id.clone(),
+            ordered_track_ids: ordered_track_ids.to_vec(),
+            current_index: selected_index,
+            complete,
+        };
+        self.select_current();
+        Ok(())
+    }
+
+    fn play_album(
+        &mut self,
+        album_id: &crate::domain::AlbumId,
+        track_ids: &[TrackId],
+    ) -> Result<(), BackendError> {
+        if !self.albums.iter().any(|album| album.id == *album_id) {
+            return Err(BackendError::AlbumNotFound(album_id.clone()));
+        }
+        let tracks = track_ids
+            .iter()
+            .map(|track_id| {
+                self.library
+                    .iter()
+                    .find(|track| track.id == *track_id)
+                    .cloned()
+                    .ok_or_else(|| BackendError::TrackNotFound(track_id.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if tracks.is_empty() {
+            return Err(BackendError::AlbumNotFound(album_id.clone()));
+        }
+        self.queue = tracks
+            .into_iter()
+            .enumerate()
+            .map(|(index, track)| QueueItem::new(format!("mock-album-{index:03}"), track))
+            .collect();
+        self.current_index = 0;
+        self.playback.position = Duration::ZERO;
+        self.playback.status = PlaybackStatus::Playing;
+        self.playback.context = PlaybackContext::Album {
+            album_id: album_id.clone(),
+            ordered_track_ids: track_ids.to_vec(),
+            current_index: 0,
+        };
         self.select_current();
         Ok(())
     }
@@ -386,6 +528,13 @@ impl MusicBackend for MockMusicBackend {
 
     async fn execute(&mut self, command: BackendCommand) -> Result<BackendUpdate, BackendError> {
         match command {
+            BackendCommand::RefreshLibrary => {
+                return Ok(BackendUpdate::Notice {
+                    availability: BackendAvailability::Available,
+                    playback: self.playback.clone(),
+                    message: "Mock library is already ready".to_owned(),
+                });
+            }
             BackendCommand::OpenPlayer => {
                 return Err(BackendError::Unsupported(
                     crate::backend::capabilities::Capability::Launch,
@@ -401,6 +550,15 @@ impl MusicBackend for MockMusicBackend {
                     self.playback.status = PlaybackStatus::Paused;
                 }
             }
+            BackendCommand::Stop => {
+                self.playback.status = PlaybackStatus::Stopped;
+                self.playback.position = Duration::ZERO;
+                self.playback.context = PlaybackContext::NoContext;
+                return Ok(BackendUpdate::Stopped {
+                    availability: BackendAvailability::Available,
+                    playback: self.playback.clone(),
+                });
+            }
             BackendCommand::PlayPause => {
                 self.require_track()?;
                 self.playback.status = match self.playback.status {
@@ -409,15 +567,45 @@ impl MusicBackend for MockMusicBackend {
                 };
             }
             BackendCommand::PlayTrack(track_id) => self.play_track(&track_id)?,
-            BackendCommand::PlayPlaylistTrack { track_id, .. } => self.play_track(&track_id)?,
+            BackendCommand::PlayPlaylistTrack {
+                playlist_id,
+                ordered_track_ids,
+                selected_index,
+                complete,
+            } => self.play_playlist_track(
+                &playlist_id,
+                &ordered_track_ids,
+                selected_index,
+                complete,
+            )?,
             BackendCommand::PlayPlaylist(playlist_id) => self.play_playlist(&playlist_id)?,
+            BackendCommand::PlayAlbum {
+                album_id,
+                track_ids,
+            } => self.play_album(&album_id, &track_ids)?,
+            BackendCommand::LoadTrackArtwork { key, .. } => {
+                return Ok(BackendUpdate::Artwork {
+                    availability: BackendAvailability::Available,
+                    playback: self.playback.clone(),
+                    key,
+                    result: ArtworkResult::Missing,
+                });
+            }
             BackendCommand::LoadPlaylist(_) => {}
+            BackendCommand::RemovePlaylistTrack { .. } => {
+                return Err(BackendError::Unsupported(
+                    crate::backend::capabilities::Capability::PlaylistTrackRemove,
+                ));
+            }
             BackendCommand::Next => self.next_track(false)?,
             BackendCommand::Previous => self.previous_track()?,
             BackendCommand::SeekBy(seconds) => self.seek_by(seconds)?,
             BackendCommand::SetVolume(volume) => self.playback.volume = volume.min(100),
             BackendCommand::ToggleMute => self.playback.muted = !self.playback.muted,
-            BackendCommand::ToggleShuffle => self.playback.shuffle = !self.playback.shuffle,
+            BackendCommand::ToggleShuffle => {
+                self.playback.shuffle = !self.playback.shuffle;
+                self.playback.context = PlaybackContext::NoContext;
+            }
             BackendCommand::CycleRepeat => self.playback.repeat = self.playback.repeat.next(),
             BackendCommand::ToggleFavoriteCurrent => self.toggle_favorite()?,
             BackendCommand::Enqueue(track) => {
@@ -459,7 +647,10 @@ mod tests {
 
     use crate::{
         backend::{BackendCommand, BackendUpdate, MusicBackend, capabilities::Capability},
-        domain::{BackendSnapshot, PlaybackStatus, RepeatMode, Track, TrackId},
+        domain::{
+            AlbumId, BackendSnapshot, PlaybackContext, PlaybackStatus, PlaylistId, RepeatMode,
+            Track, TrackId,
+        },
     };
 
     use super::MockMusicBackend;
@@ -629,7 +820,7 @@ mod tests {
         assert_eq!(snapshot.artists.len(), 3);
         assert_eq!(snapshot.albums.len(), 3);
         assert_eq!(snapshot.stations.len(), 3);
-        assert_eq!(snapshot.playlists.len(), 3);
+        assert_eq!(snapshot.playlists.len(), 5);
         assert_eq!(snapshot.artists[0].name, "The Asyncs");
         assert_eq!(snapshot.albums[0].title, "Event Loop");
         assert_eq!(snapshot.stations[0].name, "Apple Music 1 (Mock)");
@@ -655,5 +846,104 @@ mod tests {
             TrackId::new("mock-004")
         );
         assert_eq!(snapshot.playback.position, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn play_album_replaces_queue_in_supplied_track_order() {
+        let mut backend = MockMusicBackend::new();
+
+        let snapshot = snapshot(
+            backend
+                .execute(BackendCommand::PlayAlbum {
+                    album_id: AlbumId::new("mock-album-event-loop"),
+                    track_ids: vec![TrackId::new("mock-003"), TrackId::new("mock-001")],
+                })
+                .await
+                .expect("play mock album"),
+        );
+
+        assert_eq!(snapshot.playback.status, PlaybackStatus::Playing);
+        assert_eq!(
+            snapshot
+                .queue
+                .iter()
+                .map(|entry| entry.track.id.clone())
+                .collect::<Vec<_>>(),
+            vec![TrackId::new("mock-003"), TrackId::new("mock-001")]
+        );
+        assert_eq!(
+            snapshot
+                .playback
+                .current_track
+                .expect("first album track")
+                .id,
+            TrackId::new("mock-003")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_mock_playlist_track_keeps_ordered_context_and_advances() {
+        let mut backend = MockMusicBackend::new();
+        let ordered_track_ids = vec![
+            TrackId::new("mock-001"),
+            TrackId::new("mock-003"),
+            TrackId::new("mock-005"),
+        ];
+        let started = snapshot(
+            backend
+                .execute(BackendCommand::PlayPlaylistTrack {
+                    playlist_id: PlaylistId::new("mock-playlist-terminal-focus"),
+                    ordered_track_ids: ordered_track_ids.clone(),
+                    selected_index: 1,
+                    complete: true,
+                })
+                .await
+                .expect("start mock playlist context"),
+        );
+        assert!(matches!(
+            started.playback.context,
+            PlaybackContext::Playlist {
+                current_index: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            started.playback.current_track.expect("selected track").id,
+            TrackId::new("mock-003")
+        );
+
+        let advanced = snapshot(
+            backend
+                .tick(Duration::from_secs(264))
+                .await
+                .expect("mock tick")
+                .expect("mock transition"),
+        );
+        assert_eq!(
+            advanced.playback.current_track.expect("next track").id,
+            TrackId::new("mock-005")
+        );
+        assert_eq!(
+            advanced.playback.context,
+            PlaybackContext::Playlist {
+                playlist_id: PlaylistId::new("mock-playlist-terminal-focus"),
+                ordered_track_ids,
+                current_index: 2,
+                complete: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_clears_mock_playback_context() {
+        let mut backend = MockMusicBackend::new();
+        backend.execute(BackendCommand::Play).await.expect("play");
+        let BackendUpdate::Stopped { playback, .. } =
+            backend.execute(BackendCommand::Stop).await.expect("stop")
+        else {
+            panic!("stop must acknowledge shutdown");
+        };
+        assert_eq!(playback.status, PlaybackStatus::Stopped);
+        assert_eq!(playback.context, PlaybackContext::NoContext);
     }
 }

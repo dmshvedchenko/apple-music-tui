@@ -8,11 +8,22 @@ pub enum TrackSelector {
 pub enum ScriptRequest {
     FullState,
     Poll,
+    PollPlaylistTransition {
+        playlist_persistent_id: String,
+        expected: TrackSelector,
+        target: TrackSelector,
+        max_wait_ms: u64,
+    },
     DiscoverPlaylists,
     LibraryBatch {
         start: usize,
         limit: usize,
         total: Option<usize>,
+    },
+    #[cfg(test)]
+    ProfileLibraryBatch {
+        start: usize,
+        limit: usize,
     },
     PlaylistBatch {
         playlist_persistent_id: String,
@@ -23,13 +34,24 @@ pub enum ScriptRequest {
     OpenPlayer,
     Play,
     Pause,
+    Stop,
     PlayPause,
     PlayTrack(TrackSelector),
-    PlayPlaylistTrack {
+    PlayTrackOnce(TrackSelector),
+    LoadTrackArtwork {
+        track: TrackSelector,
+        max_bytes: usize,
+    },
+    PlayPlaylistTrackOnce {
         playlist_persistent_id: String,
         track: TrackSelector,
     },
     PlayPlaylist(String),
+    RemovePlaylistTrack {
+        playlist_persistent_id: String,
+        index: usize,
+        expected: TrackSelector,
+    },
     Next,
     Previous,
     SeekBy(i64),
@@ -40,7 +62,7 @@ pub enum ScriptRequest {
 
 impl ScriptRequest {
     const fn includes_favorite(&self) -> bool {
-        !matches!(self, Self::Poll)
+        !matches!(self, Self::Poll | Self::PollPlaylistTransition { .. })
     }
 
     fn operation(&self) -> String {
@@ -50,9 +72,56 @@ impl ScriptRequest {
             | Self::DiscoverPlaylists
             | Self::LibraryBatch { .. }
             | Self::PlaylistBatch { .. } => String::new(),
+            Self::PollPlaylistTransition {
+                playlist_persistent_id,
+                expected,
+                target,
+                max_wait_ms,
+            } => {
+                let (expected_property, expected_value) = selector_parts(expected);
+                let (target_property, target_value) = selector_parts(target);
+                let playlist_persistent_id = js_string(playlist_persistent_id);
+                let expected_value = js_string(expected_value);
+                let expected_is_persistent = expected_property == "persistentID";
+                let target_value = js_string(target_value);
+                format!(
+                    "const transitionDeadline = Date.now() + {max_wait_ms};\n\
+                     const initialTransitionState = String(music.playerState());\n\
+                     const initialTransitionTrack = music.currentTrack;\n\
+                     const initialPersistentId = readIdentifier(() => initialTransitionTrack.persistentID());\n\
+                     const initialDatabaseId = readIdentifier(() => initialTransitionTrack.databaseID());\n\
+                     const initialMatches = {expected_is_persistent}\n\
+                         ? initialPersistentId === {expected_value}\n\
+                         : initialDatabaseId === {expected_value};\n\
+                     if (initialMatches && initialTransitionState === 'playing') {{\n\
+                         while (Date.now() <= transitionDeadline && String(music.playerState()) === 'playing') {{\n\
+                         delay(0.05);\n\
+                     }}\n\
+                     }}\n\
+                     const finalTransitionState = String(music.playerState());\n\
+                     const finalTransitionTrack = music.currentTrack;\n\
+                     const finalPersistentId = readIdentifier(() => finalTransitionTrack.persistentID());\n\
+                     const finalDatabaseId = readIdentifier(() => finalTransitionTrack.databaseID());\n\
+                     const finalHasIdentity = finalPersistentId !== null || finalDatabaseId !== null;\n\
+                     const finalMatches = !finalHasIdentity || ({expected_is_persistent}\n\
+                         ? finalPersistentId === {expected_value}\n\
+                         : finalDatabaseId === {expected_value});\n\
+                     if (finalTransitionState === 'stopped' && finalMatches) {{\n\
+                         const transitionPlaylists = music.playlists.whose({{persistentID: {playlist_persistent_id}}})();\n\
+                         if (transitionPlaylists.length === 0) throw new Error('Playlist continuation source is no longer available');\n\
+                         const transitionTargets = transitionPlaylists[0].tracks.whose({{{target_property}: {target_value}}})();\n\
+                         if (transitionTargets.length === 0) throw new Error('Next playlist track is no longer available');\n\
+                         music.play(transitionTargets[0], {{once: true}});\n\
+                         result.sessionAdvanced = true;\n\
+                     }}"
+                )
+            }
+            #[cfg(test)]
+            Self::ProfileLibraryBatch { .. } => String::new(),
             Self::OpenPlayer => "music.activate();".to_owned(),
             Self::Play => "music.play();".to_owned(),
             Self::Pause => "music.pause();".to_owned(),
+            Self::Stop => "music.stop();".to_owned(),
             Self::PlayPause => "music.playpause();".to_owned(),
             Self::PlayTrack(selector) => {
                 let (property, value) = match selector {
@@ -66,7 +135,53 @@ impl ScriptRequest {
                      music.play(selectedTracks[0]);"
                 )
             }
-            Self::PlayPlaylistTrack {
+            Self::PlayTrackOnce(selector) => {
+                let (property, value) = match selector {
+                    TrackSelector::PersistentId(value) => ("persistentID", value),
+                    TrackSelector::DatabaseId(value) => ("databaseID", value),
+                };
+                let value = js_string(value);
+                format!(
+                    "const selectedTracks = music.libraryPlaylists()[0].tracks.whose({{{property}: {value}}})();\n\
+                     if (selectedTracks.length === 0) throw new Error('Selected album track is no longer available');\n\
+                     music.play(selectedTracks[0], {{once: true}});"
+                )
+            }
+            Self::LoadTrackArtwork { track, max_bytes } => {
+                let (property, value) = match track {
+                    TrackSelector::PersistentId(value) => ("persistentID", value),
+                    TrackSelector::DatabaseId(value) => ("databaseID", value),
+                };
+                let value = js_string(value);
+                format!(
+                    "const artworkCandidates = [];\n\
+                     const artworkAttempts = [];\n\
+                     const artworkCurrent = safe(() => music.currentTrack());\n\
+                     const artworkCurrentId = artworkCurrent === null ? null : readIdentifier(() => artworkCurrent.{property}());\n\
+                     if (artworkCurrentId !== null && artworkCurrentId === {value}) {{ artworkCandidates.push({{ track: artworkCurrent, resolver: 'current_track' }}); artworkAttempts.push('current_track:matched'); }} else artworkAttempts.push('current_track:identity_mismatch');\n\
+                     const artworkLibraryTracks = safe(() => music.libraryPlaylists()[0].tracks.whose({{{property}: {value}}})()) || [];\n\
+                     if (artworkLibraryTracks.length > 0) {{ artworkCandidates.push({{ track: artworkLibraryTracks[0], resolver: '{property}_library' }}); artworkAttempts.push('{property}_library:matched'); }} else artworkAttempts.push('{property}_library:not_found');\n\
+                     let artworkSawNoArtwork = false;\n\
+                     let artworkResolved = false;\n\
+                     for (const artworkCandidate of artworkCandidates) {{\n\
+                         const artworkItems = safe(() => artworkCandidate.track.artworks()) || [];\n\
+                         if (artworkItems.length === 0) {{ artworkSawNoArtwork = true; artworkAttempts.push(artworkCandidate.resolver + ':no_artwork'); continue; }}\n\
+                         const descriptor = readText(() => artworkItems[0].rawData());\n\
+                         const match = descriptor === null ? null : /\\(\\$([0-9A-Fa-f]+)\\$\\)/.exec(descriptor);\n\
+                         if (match === null) {{ artworkSawNoArtwork = true; artworkAttempts.push(artworkCandidate.resolver + ':unreadable'); continue; }}\n\
+                         const encodedBytes = Math.floor(match[1].length / 2);\n\
+                         result.artwork = encodedBytes > {max_bytes}\n\
+                             ? {{ tooLarge: true, encodedBytes, resolver: artworkCandidate.resolver, attempts: artworkAttempts }}\n\
+                             : {{ rawData: match[1], encodedBytes, resolver: artworkCandidate.resolver, attempts: artworkAttempts }};\n\
+                         artworkResolved = true;\n\
+                         break;\n\
+                     }}\n\
+                     if (!artworkResolved) result.artwork = artworkSawNoArtwork\n\
+                         ? {{ missing: true, attempts: artworkAttempts }}\n\
+                         : {{ transient: true, reason: 'requested artwork track could not be resolved from currentTrack or library', attempts: artworkAttempts }};"
+                )
+            }
+            Self::PlayPlaylistTrackOnce {
                 playlist_persistent_id,
                 track,
             } => {
@@ -81,7 +196,7 @@ impl ScriptRequest {
                      if (selectedPlaylists.length === 0) throw new Error('Selected playlist is no longer available');\n\
                      const selectedTracks = selectedPlaylists[0].tracks.whose({{{property}: {value}}})();\n\
                      if (selectedTracks.length === 0) throw new Error('Selected track is no longer available in this playlist');\n\
-                     music.play(selectedTracks[0]);"
+                     music.play(selectedTracks[0], {{once: true}});"
                 )
             }
             Self::PlayPlaylist(persistent_id) => {
@@ -90,6 +205,26 @@ impl ScriptRequest {
                     "const selectedPlaylists = music.playlists.whose({{persistentID: {persistent_id}}})();\n\
                      if (selectedPlaylists.length === 0) throw new Error('Selected playlist is no longer available');\n\
                      music.play(selectedPlaylists[0]);"
+                )
+            }
+            Self::RemovePlaylistTrack {
+                playlist_persistent_id,
+                index,
+                expected,
+            } => {
+                let (property, value) = selector_parts(expected);
+                let playlist_persistent_id = js_string(playlist_persistent_id);
+                let value = js_string(value);
+                format!(
+                    "const editablePlaylists = music.userPlaylists.whose({{persistentID: {playlist_persistent_id}}})();\n\
+                     if (editablePlaylists.length === 0) throw new Error('Editable user playlist is no longer available');\n\
+                     const editablePlaylist = editablePlaylists[0];\n\
+                     if (Boolean(safe(() => editablePlaylist.smart()))) throw new Error('Smart playlists cannot be edited');\n\
+                     const editableTracks = editablePlaylist.tracks();\n\
+                     if ({index} >= editableTracks.length) throw new Error('Selected playlist entry is no longer available');\n\
+                     const editableTrack = editableTracks[{index}];\n\
+                     if (readIdentifier(() => editableTrack.{property}()) !== {value}) throw new Error('Playlist changed; selected entry no longer matches');\n\
+                     music.delete(editableTrack);"
                 )
             }
             Self::Next => "music.nextTrack();".to_owned(),
@@ -149,6 +284,19 @@ pub fn build_script(request: &ScriptRequest) -> String {
                 "result.libraryBatch = readTrackBatch(music.libraryPlaylists()[0], {start}, {limit}, {total});\n"
             ));
         }
+        #[cfg(test)]
+        ScriptRequest::ProfileLibraryBatch { start, limit } => {
+            script.push_str(SCRIPT_BATCH_HELPERS);
+            script.push_str(&format!(
+                "const profileTotal = music.libraryPlaylists()[0].tracks().length;\n\
+                 const collectionStarted = Date.now();\n\
+                 result.libraryBatch = readTrackBatch(music.libraryPlaylists()[0], {start}, {limit}, profileTotal);\n\
+                 const collectionMs = Date.now() - collectionStarted;\n\
+                 const serializationStarted = Date.now();\n\
+                 JSON.stringify(result);\n\
+                 result.profile = {{ collectionMs, serializationMs: Date.now() - serializationStarted }};\n"
+            ));
+        }
         ScriptRequest::PlaylistBatch {
             playlist_persistent_id,
             start,
@@ -179,6 +327,13 @@ pub fn build_script(request: &ScriptRequest) -> String {
 
 fn js_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a Rust string to JSON cannot fail")
+}
+
+fn selector_parts(selector: &TrackSelector) -> (&'static str, &str) {
+    match selector {
+        TrackSelector::PersistentId(value) => ("persistentID", value),
+        TrackSelector::DatabaseId(value) => ("databaseID", value),
+    }
 }
 
 const SCRIPT_PREFIX: &str = r#"(() => {
@@ -408,6 +563,75 @@ mod tests {
         assert!(selected.contains(r#"persistentID: "ABC\"; malicious()""#));
         assert!(!selected.contains("persistentID: ABC"));
         assert!(!seek.contains("sh -c"));
+
+        let artwork = build_script(&ScriptRequest::LoadTrackArtwork {
+            track: TrackSelector::DatabaseId("42\"; malicious()".to_owned()),
+            max_bytes: 1_024,
+        });
+        assert!(artwork.contains(r#"databaseID: "42\"; malicious()""#));
+        assert!(artwork.contains("encodedBytes > 1024"));
+        assert!(!artwork.contains("databaseID: 42"));
+        assert!(artwork.contains("music.currentTrack()"));
+        assert!(artwork.contains("resolver: 'current_track'"));
+        assert!(artwork.contains("databaseID_library"));
+        assert!(artwork.contains("artworkCurrentId !== null"));
+        assert!(artwork.contains("artworkAttempts"));
+
+        let playlist_track = build_script(&ScriptRequest::PlayPlaylistTrackOnce {
+            playlist_persistent_id: "P\"; malicious()".to_owned(),
+            track: TrackSelector::PersistentId("T\"; malicious()".to_owned()),
+        });
+        assert!(playlist_track.contains(r#"persistentID: "P\"; malicious()""#));
+        assert!(playlist_track.contains(r#"persistentID: "T\"; malicious()""#));
+        assert!(playlist_track.contains("music.play(selectedTracks[0], {once: true})"));
+
+        let transition = build_script(&ScriptRequest::PollPlaylistTransition {
+            playlist_persistent_id: "P\"; malicious()".to_owned(),
+            expected: TrackSelector::PersistentId("FROM\"; malicious()".to_owned()),
+            target: TrackSelector::DatabaseId("42\"; malicious()".to_owned()),
+            max_wait_ms: 2_000,
+        });
+        assert!(transition.contains(r#"initialPersistentId === "FROM\"; malicious()""#));
+        assert!(transition.contains(r#"databaseID: "42\"; malicious()""#));
+        assert!(transition.contains("Date.now() + 2000"));
+        assert!(transition.contains("delay(0.05)"));
+        assert!(transition.contains("result.sessionAdvanced = true"));
+
+        let removal = build_script(&ScriptRequest::RemovePlaylistTrack {
+            playlist_persistent_id: "PLAYLIST-123".to_owned(),
+            index: 2,
+            expected: TrackSelector::PersistentId("TRACK-456".to_owned()),
+        });
+        assert!(removal.contains("music.userPlaylists.whose({persistentID: \"PLAYLIST-123\"})"));
+        assert!(removal.contains("editableTracks[2]"));
+        assert!(removal.contains("editableTrack.persistentID()) !== \"TRACK-456\""));
+        assert!(removal.contains("music.delete(editableTrack);"));
+        assert!(!removal.contains("\\\\\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_removal_script_parses_without_running_it() {
+        use std::process::Command;
+
+        let script = build_script(&ScriptRequest::RemovePlaylistTrack {
+            playlist_persistent_id: "PLAYLIST-123".to_owned(),
+            index: 2,
+            expected: TrackSelector::PersistentId("TRACK-456".to_owned()),
+        });
+        let probe = format!(
+            "new Function({});",
+            serde_json::to_string(&script).expect("script JSON string")
+        );
+        let output = Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", &probe])
+            .output()
+            .expect("run macOS JavaScript parser");
+        assert!(
+            output.status.success(),
+            "generated removal JXA did not parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

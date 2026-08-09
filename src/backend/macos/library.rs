@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::domain::{
     Album, AlbumId, Artist, DataOrigin, MusicAppDatabaseId, MusicAppPersistentId, Playlist,
-    PlaylistId, PlaylistKind, Track, TrackId, TrackMetadata,
+    PlaylistId, PlaylistKind, RecentlyPlayedEntry, Track, TrackId, TrackMetadata,
 };
 
 use super::parser::{RawPlaylist, RawTrack};
@@ -16,6 +16,7 @@ pub struct DerivedLibrary {
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
     pub recently_added: Vec<Album>,
+    pub recently_played: Vec<RecentlyPlayedEntry>,
 }
 
 pub fn raw_track_to_domain(raw: RawTrack) -> Track {
@@ -108,6 +109,7 @@ pub fn persistent_playlist_selector(id: &PlaylistId) -> Option<&str> {
 
 #[must_use]
 pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
+    let albums_started = Instant::now();
     let mut grouped_albums: BTreeMap<String, Vec<Track>> = BTreeMap::new();
     for track in tracks {
         let album_artist = track
@@ -116,9 +118,10 @@ pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
             .as_deref()
             .unwrap_or(&track.artist);
         let key = format!(
-            "{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}",
             normalized_key(album_artist),
-            normalized_key(&track.album)
+            normalized_key(&track.album),
+            track.metadata.year.unwrap_or_default()
         );
         grouped_albums.entry(key).or_default().push(track.clone());
     }
@@ -128,14 +131,16 @@ pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
         .map(|(key, mut tracks)| {
             tracks.sort_by(|left, right| {
                 (
-                    left.metadata.disc_number,
-                    left.metadata.track_number,
+                    left.metadata.disc_number.unwrap_or(1),
+                    left.metadata.track_number.unwrap_or(u16::MAX),
                     &left.title,
+                    &left.id,
                 )
                     .cmp(&(
-                        right.metadata.disc_number,
-                        right.metadata.track_number,
+                        right.metadata.disc_number.unwrap_or(1),
+                        right.metadata.track_number.unwrap_or(u16::MAX),
                         &right.title,
+                        &right.id,
                     ))
             });
             let first = &tracks[0];
@@ -171,7 +176,9 @@ pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
             .cmp(&normalized_key(&right.artist))
             .then_with(|| normalized_key(&left.title).cmp(&normalized_key(&right.title)))
     });
+    let albums_elapsed = albums_started.elapsed();
 
+    let artists_started = Instant::now();
     let mut albums_by_artist: BTreeMap<String, BTreeSet<AlbumId>> = BTreeMap::new();
     let mut tracks_by_artist: BTreeMap<String, Vec<TrackId>> = BTreeMap::new();
     let mut display_names: BTreeMap<String, String> = BTreeMap::new();
@@ -217,7 +224,9 @@ pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
             )
         })
         .collect();
+    let artists_elapsed = artists_started.elapsed();
 
+    let recent_started = Instant::now();
     let mut recently_added = albums.clone();
     recently_added.sort_by(|left, right| {
         right
@@ -226,10 +235,47 @@ pub fn derive_library(tracks: &[Track]) -> DerivedLibrary {
             .then_with(|| left.title.cmp(&right.title))
     });
 
+    let mut recent_by_track = BTreeMap::<TrackId, RecentlyPlayedEntry>::new();
+    for track in tracks {
+        let Some(played_at) = track.metadata.last_played_date.clone() else {
+            continue;
+        };
+        let candidate = RecentlyPlayedEntry {
+            track_id: track.id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            play_count: track.metadata.play_count,
+            played_at,
+        };
+        let should_replace = recent_by_track
+            .get(&track.id)
+            .is_none_or(|existing| candidate.played_at > existing.played_at);
+        if should_replace {
+            recent_by_track.insert(track.id.clone(), candidate);
+        }
+    }
+    let mut recently_played = recent_by_track.into_values().collect::<Vec<_>>();
+    recently_played.sort_by(|left, right| {
+        right
+            .played_at
+            .cmp(&left.played_at)
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.track_id.cmp(&right.track_id))
+    });
+    let recent_elapsed = recent_started.elapsed();
+    tracing::debug!(
+        tracks = tracks.len(),
+        albums_ms = albums_elapsed.as_secs_f64() * 1_000.0,
+        artists_ms = artists_elapsed.as_secs_f64() * 1_000.0,
+        recent_views_ms = recent_elapsed.as_secs_f64() * 1_000.0,
+        "local library grouping timing"
+    );
+
     DerivedLibrary {
         artists,
         albums,
         recently_added,
+        recently_played,
     }
 }
 
@@ -346,6 +392,69 @@ mod tests {
         assert_eq!(first.artists.len(), 1);
         assert_eq!(first.albums.len(), 2);
         assert_eq!(first.recently_added[0].title, "Newer");
+    }
+
+    #[test]
+    fn album_identity_separates_reissues_and_orders_multiple_discs() {
+        let mut disc_two = raw("d2t1", "Disc Two", "Artist", "Shared Title", "2025-01-01");
+        disc_two.disc_number = Some(2);
+        disc_two.track_number = Some(1);
+        let mut disc_one_two = raw("d1t2", "Second", "Artist", "Shared Title", "2025-01-01");
+        disc_one_two.disc_number = Some(1);
+        disc_one_two.track_number = Some(2);
+        let mut disc_one_one = raw("d1t1", "First", "Artist", "Shared Title", "2025-01-01");
+        disc_one_one.disc_number = Some(1);
+        disc_one_one.track_number = Some(1);
+        let mut reissue = raw("reissue", "Reissue", "Artist", "Shared Title", "2026-01-01");
+        reissue.year = Some(2026);
+
+        let derived = derive_library(
+            &[disc_two, disc_one_two, disc_one_one, reissue]
+                .into_iter()
+                .map(raw_track_to_domain)
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(derived.albums.len(), 2);
+        let original = derived
+            .albums
+            .iter()
+            .find(|album| album.year == 2025)
+            .expect("original album");
+        assert_eq!(
+            original
+                .tracks
+                .iter()
+                .map(|track| track.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "Second", "Disc Two"]
+        );
+    }
+
+    #[test]
+    fn recently_played_uses_latest_real_date_and_deduplicates_track_identity() {
+        let mut older = raw("same", "Song", "Artist", "Album", "2025-01-01");
+        older.played_date = Some("2026-08-01T10:00:00.000Z".to_owned());
+        let mut newer = older.clone();
+        newer.played_date = Some("2026-08-03T10:00:00.000Z".to_owned());
+        let mut second = raw("second", "Second", "Artist", "Album", "2025-01-01");
+        second.played_date = Some("2026-08-02T10:00:00.000Z".to_owned());
+        let missing = raw("missing", "Never", "Artist", "Album", "2025-01-01");
+
+        let derived = derive_library(
+            &[older, newer, second, missing]
+                .into_iter()
+                .map(raw_track_to_domain)
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(derived.recently_played.len(), 2);
+        assert_eq!(derived.recently_played[0].title, "Song");
+        assert_eq!(
+            derived.recently_played[0].played_at,
+            "2026-08-03T10:00:00.000Z"
+        );
+        assert_eq!(derived.recently_played[1].title, "Second");
     }
 
     #[test]

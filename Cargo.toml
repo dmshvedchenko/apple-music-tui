@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A keyboard-first terminal interface for Apple Music"
+license = "MIT"
+repository = "https://github.com/dmshvedchenko/apple-music-tui"
+readme = "README.md"
+keywords = ["apple-music", "music", "tui", "terminal", "macos"]
+categories = ["command-line-utilities", "multimedia"]
 
 [dependencies]
 async-trait = "0.1.91"
+base64 = "0.22.1"
+image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
 jsonwebtoken = { version = "11.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 rand = "0.9"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }

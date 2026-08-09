@@ -53,13 +53,19 @@ impl KeyMatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BindingAction {
     Quit,
+    OpenNowPlaying,
+    RefreshLibrary,
     OpenPlayer,
     MoveUp,
     MoveDown,
+    JumpToStart,
+    JumpToEnd,
+    PageUp,
+    PageDown,
     FocusLeft,
     FocusRight,
     OpenSelected,
-    PlaySelectedPlaylist,
+    PlaySelectedCollection,
     StartSearch,
     GoToNumberedScreen,
     Play,
@@ -76,6 +82,11 @@ enum BindingAction {
     CycleRepeat,
     ToggleFavorite,
     ToggleHelp,
+    OpenActions,
+    RequestPlaylistTrackRemoval,
+    OpenCollectionSort,
+    StartCollectionFilter,
+    ClearCollectionFilter,
     Back,
 }
 
@@ -83,13 +94,19 @@ impl BindingAction {
     fn to_action(self, event: &KeyEvent) -> Option<Action> {
         match self {
             Self::Quit => Some(Action::Quit),
+            Self::OpenNowPlaying => Some(Action::OpenNowPlaying),
+            Self::RefreshLibrary => Some(Action::RefreshLibrary),
             Self::OpenPlayer => Some(Action::OpenPlayer),
             Self::MoveUp => Some(Action::MoveUp),
             Self::MoveDown => Some(Action::MoveDown),
+            Self::JumpToStart => Some(Action::JumpToStart),
+            Self::JumpToEnd => Some(Action::JumpToEnd),
+            Self::PageUp => Some(Action::PageUp),
+            Self::PageDown => Some(Action::PageDown),
             Self::FocusLeft => Some(Action::FocusLeft),
             Self::FocusRight => Some(Action::FocusRight),
             Self::OpenSelected => Some(Action::OpenSelected),
-            Self::PlaySelectedPlaylist => Some(Action::PlaySelectedPlaylist),
+            Self::PlaySelectedCollection => Some(Action::PlaySelectedCollection),
             Self::StartSearch => Some(Action::StartSearch),
             Self::GoToNumberedScreen => {
                 let KeyCode::Char(number) = event.code else {
@@ -112,6 +129,11 @@ impl BindingAction {
             Self::CycleRepeat => Some(Action::CycleRepeat),
             Self::ToggleFavorite => Some(Action::ToggleFavorite),
             Self::ToggleHelp => Some(Action::ToggleHelp),
+            Self::OpenActions => Some(Action::OpenActions),
+            Self::RequestPlaylistTrackRemoval => Some(Action::RequestPlaylistTrackRemoval),
+            Self::OpenCollectionSort => Some(Action::OpenCollectionSort),
+            Self::StartCollectionFilter => Some(Action::StartCollectionFilter),
+            Self::ClearCollectionFilter => Some(Action::ClearCollectionFilter),
             Self::Back => Some(Action::Back),
         }
     }
@@ -131,6 +153,34 @@ const BINDINGS: &[KeyBinding] = &[
         group: BindingGroup::Navigation,
         matches: &[KeyMatch::Character('k'), KeyMatch::Code(KeyCode::Up)],
         action: BindingAction::MoveUp,
+    },
+    KeyBinding {
+        keys: "gg / Home",
+        description: "jump to first item",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('g'), KeyMatch::Code(KeyCode::Home)],
+        action: BindingAction::JumpToStart,
+    },
+    KeyBinding {
+        keys: "G / End",
+        description: "jump to last item",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('G'), KeyMatch::Code(KeyCode::End)],
+        action: BindingAction::JumpToEnd,
+    },
+    KeyBinding {
+        keys: "Ctrl-u / PgUp",
+        description: "page up",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Control('u'), KeyMatch::Code(KeyCode::PageUp)],
+        action: BindingAction::PageUp,
+    },
+    KeyBinding {
+        keys: "Ctrl-d / PgDn",
+        description: "page down",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Control('d'), KeyMatch::Code(KeyCode::PageDown)],
+        action: BindingAction::PageDown,
     },
     KeyBinding {
         keys: "h / ←",
@@ -155,10 +205,10 @@ const BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "P",
-        description: "play selected playlist",
+        description: "play selected album or playlist",
         group: BindingGroup::Playback,
         matches: &[KeyMatch::Character('P')],
-        action: BindingAction::PlaySelectedPlaylist,
+        action: BindingAction::PlaySelectedCollection,
     },
     KeyBinding {
         keys: "1–9",
@@ -252,6 +302,41 @@ const BINDINGS: &[KeyBinding] = &[
         action: BindingAction::ToggleShuffle,
     },
     KeyBinding {
+        keys: "N",
+        description: "open Now Playing",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('N')],
+        action: BindingAction::OpenNowPlaying,
+    },
+    KeyBinding {
+        keys: "R",
+        description: "refresh local library",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('R')],
+        action: BindingAction::RefreshLibrary,
+    },
+    KeyBinding {
+        keys: "S",
+        description: "sort current library view",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('S')],
+        action: BindingAction::OpenCollectionSort,
+    },
+    KeyBinding {
+        keys: "F",
+        description: "filter current library view",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('F')],
+        action: BindingAction::StartCollectionFilter,
+    },
+    KeyBinding {
+        keys: "Ctrl-l",
+        description: "clear current library filter",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Control('l')],
+        action: BindingAction::ClearCollectionFilter,
+    },
+    KeyBinding {
         keys: "r",
         description: "cycle repeat",
         group: BindingGroup::Playback,
@@ -271,6 +356,20 @@ const BINDINGS: &[KeyBinding] = &[
         group: BindingGroup::General,
         matches: &[KeyMatch::Character('?')],
         action: BindingAction::ToggleHelp,
+    },
+    KeyBinding {
+        keys: "a",
+        description: "actions for selected item",
+        group: BindingGroup::General,
+        matches: &[KeyMatch::Character('a')],
+        action: BindingAction::OpenActions,
+    },
+    KeyBinding {
+        keys: "d",
+        description: "remove selected playlist track",
+        group: BindingGroup::General,
+        matches: &[KeyMatch::Character('d')],
+        action: BindingAction::RequestPlaylistTrackRemoval,
     },
     KeyBinding {
         keys: "o",
@@ -326,6 +425,7 @@ pub fn map_search_key(event: KeyEvent) -> Option<Action> {
         return Some(Action::Quit);
     }
     match event.code {
+        KeyCode::Char('?') if event.modifiers == KeyModifiers::SHIFT => Some(Action::ToggleHelp),
         KeyCode::Esc => Some(Action::Back),
         KeyCode::Enter => Some(Action::SubmitSearch),
         KeyCode::Backspace => Some(Action::SearchBackspace),
@@ -340,13 +440,39 @@ pub fn map_search_key(event: KeyEvent) -> Option<Action> {
     }
 }
 
+#[must_use]
+pub fn map_collection_filter_key(event: KeyEvent) -> Option<Action> {
+    if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    if event.code == KeyCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Action::Quit);
+    }
+    match event.code {
+        KeyCode::Esc => Some(Action::Back),
+        KeyCode::Enter => Some(Action::SubmitCollectionFilter),
+        KeyCode::Backspace => Some(Action::CollectionFilterBackspace),
+        KeyCode::Char('l') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(Action::ClearCollectionFilter)
+        }
+        KeyCode::Char(character)
+            if !event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(Action::CollectionFilterInput(character))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use crate::app::{action::Action, state::Screen};
 
-    use super::{bindings, map_key, map_search_key};
+    use super::{bindings, map_collection_filter_key, map_key, map_search_key};
 
     #[test]
     fn maps_keys_to_semantic_actions() {
@@ -359,6 +485,14 @@ mod tests {
             Some(Action::PlayPause)
         );
         assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some(Action::RefreshLibrary)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(Action::OpenNowPlaying)
+        );
+        assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
             Some(Action::Play)
         );
@@ -367,7 +501,7 @@ mod tests {
             Some(Action::Pause)
         );
         assert_eq!(
-            map_key(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE)),
+            map_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE)),
             Some(Action::GoTo(Screen::Songs))
         );
         assert_eq!(
@@ -387,6 +521,22 @@ mod tests {
             Some(Action::MoveUp)
         );
         assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(Action::JumpToStart)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            Some(Action::JumpToEnd)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(Action::Quit)
         );
@@ -397,6 +547,22 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
             Some(Action::OpenPlayer)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(Action::OpenActions)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(Action::RequestPlaylistTrackRemoval)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Some(Action::OpenCollectionSort)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            Some(Action::StartCollectionFilter)
         );
     }
 
@@ -423,12 +589,32 @@ mod tests {
             Some(Action::SearchInput('q'))
         );
         assert_eq!(
+            map_search_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Some(Action::ToggleHelp)
+        );
+        assert_eq!(
             map_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
             Some(Action::SearchBackspace)
         );
         assert_eq!(
             map_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Action::SubmitSearch)
+        );
+    }
+
+    #[test]
+    fn collection_filter_mode_keeps_text_editing_local() {
+        assert_eq!(
+            map_collection_filter_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Action::CollectionFilterInput('q'))
+        );
+        assert_eq!(
+            map_collection_filter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(Action::CollectionFilterBackspace)
+        );
+        assert_eq!(
+            map_collection_filter_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Some(Action::ClearCollectionFilter)
         );
     }
 

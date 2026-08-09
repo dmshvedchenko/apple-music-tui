@@ -4,5 +4,7 @@
 /.env.*
 *.log
 *.p8
+AuthKey_*.p8
+*.key
+*.der
 config.local.toml
-

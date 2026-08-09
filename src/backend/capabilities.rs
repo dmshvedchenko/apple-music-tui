@@ -12,7 +12,10 @@ pub enum Capability {
     Favorite,
     LibraryRead,
     PlaylistRead,
+    PlaylistTrackRemove,
     SelectionPlayback,
+    AlbumPlayback,
+    ArtworkRead,
     QueueRead,
     QueueWrite,
     QueueReorder,
@@ -40,6 +43,7 @@ impl Capabilities {
             Capability::LibraryRead,
             Capability::PlaylistRead,
             Capability::SelectionPlayback,
+            Capability::AlbumPlayback,
             Capability::QueueRead,
             Capability::QueueWrite,
             Capability::QueueReorder,
@@ -57,7 +61,10 @@ impl Capabilities {
             Capability::Repeat,
             Capability::LibraryRead,
             Capability::PlaylistRead,
+            Capability::PlaylistTrackRemove,
             Capability::SelectionPlayback,
+            Capability::AlbumPlayback,
+            Capability::ArtworkRead,
         ])
     }
 

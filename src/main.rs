@@ -1,4 +1,9 @@
-use std::process::ExitCode;
+use std::{
+    io::{Write as _, stdout},
+    process::ExitCode,
+    thread,
+    time::Duration,
+};
 
 use apple_music_tui::{
     auth::{
@@ -6,13 +11,18 @@ use apple_music_tui::{
         DeveloperTokenProvider, DeveloperTokenService, KeychainCredentialStore, load_apple_config,
         local_auth_status,
     },
-    backend::{MusicBackend, macos::MacOsMusicBackend, mock::MockMusicBackend},
+    backend::{
+        MusicBackend,
+        macos::{LocalCacheClearResult, MacOsMusicBackend},
+        mock::MockMusicBackend,
+    },
     cli::{AuthCommand, BackendChoice, CliAction},
     config::default_config_path,
     doctor,
     error::AppError,
     runtime,
     terminal::{TerminalSession, install_panic_hook},
+    ui::artwork,
 };
 
 #[tokio::main]
@@ -61,6 +71,12 @@ async fn run() -> Result<(), AppError> {
             doctor::run().await.print();
             Ok(())
         }
+        CliAction::CacheStatus => {
+            print_cache_status();
+            Ok(())
+        }
+        CliAction::CacheClear => clear_cache(),
+        CliAction::ArtworkTest => run_artwork_test(),
         CliAction::Auth(command) => run_auth(command).await,
         CliAction::Run(BackendChoice::Mock) => run_tui(MockMusicBackend::new()).await,
         CliAction::Run(BackendChoice::Macos) => run_tui(MacOsMusicBackend::new()).await,
@@ -69,6 +85,79 @@ async fn run() -> Result<(), AppError> {
             Err(AppError::UnavailableBackend(backend.to_string()))
         }
     }
+}
+
+fn print_cache_status() {
+    let cache = MacOsMusicBackend::local_cache_status();
+    println!("Music.app local library cache\n");
+    println!(
+        "path: {}",
+        cache.path.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |path| path.display().to_string()
+        )
+    );
+    println!(
+        "schema: {}",
+        cache
+            .schema_version
+            .map_or_else(|| "unknown".to_owned(), |version| version.to_string())
+    );
+    println!(
+        "tracks: {}",
+        cache
+            .tracks
+            .map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+    );
+    println!(
+        "playlists: {}",
+        cache
+            .playlists
+            .map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+    );
+    println!(
+        "last updated: {}",
+        cache
+            .last_updated_unix_seconds
+            .map_or_else(|| "unknown".to_owned(), |seconds| format!("Unix {seconds}"))
+    );
+    println!("readable: {}", if cache.readable { "yes" } else { "no" });
+}
+
+fn clear_cache() -> Result<(), AppError> {
+    match MacOsMusicBackend::clear_local_cache().map_err(AppError::Terminal)? {
+        LocalCacheClearResult::Removed => println!("Removed local Music.app metadata cache."),
+        LocalCacheClearResult::NotFound => {
+            println!("No local Music.app metadata cache was present.")
+        }
+        LocalCacheClearResult::Unavailable => {
+            println!("Local Music.app metadata cache path is unavailable.")
+        }
+    }
+    Ok(())
+}
+
+fn run_artwork_test() -> Result<(), AppError> {
+    let mut output = stdout();
+    writeln!(
+        output,
+        "Artwork Kitty probe: the opaque red 1x1 PNG appears below this line for two seconds."
+    )
+    .and_then(|_| output.flush())
+    .map_err(AppError::Terminal)?;
+    let report = artwork::write_kitty_probe(&mut output).map_err(AppError::Terminal)?;
+    if report.flush_succeeded {
+        thread::sleep(Duration::from_secs(2));
+        output
+            .write_all(b"\x1b[2B\r")
+            .and_then(|_| output.flush())
+            .map_err(AppError::Terminal)?;
+    }
+    writeln!(output, "\nArtwork Kitty probe report").map_err(AppError::Terminal)?;
+    for line in report.lines() {
+        writeln!(output, "{line}").map_err(AppError::Terminal)?;
+    }
+    Ok(())
 }
 
 async fn run_tui<B: MusicBackend>(backend: B) -> Result<(), AppError> {

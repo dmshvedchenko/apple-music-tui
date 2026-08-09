@@ -11,6 +11,7 @@ use crate::{
         validate_private_key_path, validate_storefront,
     },
     domain::BackendAvailability,
+    ui::artwork,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,9 +64,105 @@ impl DoctorReport {
 
 pub async fn run() -> DoctorReport {
     let mut report = DoctorReport::default();
+    check_release_and_local_paths(&mut report);
+    check_terminal_artwork(&mut report);
     check_platform_and_music_app(&mut report).await;
     check_authentication(&mut report).await;
     report
+}
+
+fn check_release_and_local_paths(report: &mut DoctorReport) {
+    report.push(
+        "Version",
+        CheckStatus::Pass,
+        format!("{} (Cargo package version)", env!("CARGO_PKG_VERSION")),
+    );
+    report.push(
+        "Local backend",
+        CheckStatus::Pass,
+        "Music.app is the primary local-only backend (--backend macos)",
+    );
+    match default_config_path() {
+        Ok(path) => report.push("Config path", CheckStatus::Pass, path.display().to_string()),
+        Err(error) => report.push("Config path", CheckStatus::Failure, error.to_string()),
+    }
+    let cache = MacOsMusicBackend::local_cache_status();
+    let path = cache.path.as_ref().map_or_else(
+        || "unavailable".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let detail = if cache.readable {
+        format!(
+            "{path}; schema {}; {} tracks; {} playlists; updated {}",
+            cache.schema_version.unwrap_or_default(),
+            cache.tracks.unwrap_or_default(),
+            cache.playlists.unwrap_or_default(),
+            cache
+                .last_updated_unix_seconds
+                .map_or_else(|| "unknown".to_owned(), |seconds| format!("Unix {seconds}"))
+        )
+    } else {
+        format!("{path}; no readable local metadata cache")
+    };
+    report.push(
+        "Library cache",
+        if cache.readable {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warning
+        },
+        detail,
+    );
+    report.push(
+        "Logging",
+        CheckStatus::Pass,
+        "stderr only; set RUST_LOG=apple_music_tui=debug for diagnostics",
+    );
+}
+
+fn check_terminal_artwork(report: &mut DoctorReport) {
+    let diagnostics = artwork::renderer_diagnostics();
+    report.push(
+        "Artwork TERM",
+        CheckStatus::Pass,
+        diagnostics.term.as_deref().unwrap_or("unset"),
+    );
+    report.push(
+        "Artwork TERM_PROGRAM",
+        CheckStatus::Pass,
+        diagnostics.term_program.as_deref().unwrap_or("unset"),
+    );
+    report.push(
+        "Artwork tmux",
+        CheckStatus::Pass,
+        if diagnostics.tmux { "yes" } else { "no" },
+    );
+    report.push(
+        "Artwork outer terminal",
+        if diagnostics.selection.outer_terminal().is_some() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warning
+        },
+        diagnostics.selection.outer_terminal().unwrap_or("unknown"),
+    );
+    report.push(
+        "Artwork renderer",
+        CheckStatus::Pass,
+        format!(
+            "{} via {}",
+            diagnostics.selection.protocol.label(),
+            diagnostics.selection.source.label()
+        ),
+    );
+    let passthrough = if diagnostics.selection.tmux_passthrough {
+        "Kitty graphics are wrapped for tmux passthrough (tmux must enable allow-passthrough)"
+    } else if diagnostics.tmux {
+        "not active; set APPLE_MUSIC_TUI_ARTWORK_RENDERER=kitty when the outer terminal supports Kitty graphics"
+    } else {
+        "not applicable"
+    };
+    report.push("Artwork passthrough", CheckStatus::Pass, passthrough);
 }
 
 async fn check_platform_and_music_app(report: &mut DoctorReport) {
@@ -105,7 +202,7 @@ async fn check_platform_and_music_app(report: &mut DoctorReport) {
             BackendAvailability::Error(message) => report.push(
                 "Music.app / Automation",
                 CheckStatus::Failure,
-                format!("query failed: {message}"),
+                safe_music_app_error(message),
             ),
         },
         Err(error) => report.push(
@@ -114,6 +211,12 @@ async fn check_platform_and_music_app(report: &mut DoctorReport) {
             error.to_string(),
         ),
     }
+}
+
+fn safe_music_app_error(message: String) -> String {
+    tracing::debug!(%message, "Music.app doctor query failed");
+    "Music.app query failed; ensure Music.app is installed/running and Automation is allowed"
+        .to_owned()
 }
 
 async fn check_authentication(report: &mut DoctorReport) {
@@ -319,5 +422,25 @@ mod tests {
         assert!(report.has_failures());
         assert_eq!(report.checks[0].status, CheckStatus::Warning);
         assert_eq!(report.checks[1].status, CheckStatus::Failure);
+    }
+
+    #[test]
+    fn release_diagnostics_expose_version_and_local_paths_without_secrets() {
+        let mut report = DoctorReport::default();
+        super::check_release_and_local_paths(&mut report);
+        let text = format!("{:#?}", report.checks);
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains("Config path"));
+        assert!(text.contains("Library cache"));
+        assert!(!text.contains("Authorization: Bearer"));
+    }
+
+    #[test]
+    fn doctor_sanitizes_automation_failure_detail() {
+        let detail =
+            super::safe_music_app_error("osascript error -1743: private detail".to_owned());
+        assert!(detail.contains("Music.app query failed"));
+        assert!(!detail.contains("-1743"));
+        assert!(!detail.contains("private detail"));
     }
 }

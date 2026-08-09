@@ -1,6 +1,6 @@
 # Feature Matrix
 
-Research snapshot: 2026-08-03.
+Research snapshot: 2026-08-09.
 
 This matrix records product capability assumptions. A feature is exposed by the UI only when the active backend reports the corresponding capability.
 
@@ -8,8 +8,52 @@ This matrix records product capability assumptions. A feature is exposed by the 
 
 - `SUPPORTED`: a documented planned backend can provide the feature reliably.
 - `PARTIAL`: only part of the desktop behavior or metadata is available.
+- `LOCAL_ONLY`: supported from the owned Music.app library but not equivalent to Apple cloud/catalog data.
+- `REQUIRES_APPLE_API`: needs the optional authenticated Apple catalog/personalization surface.
+- `NOT_YET_IMPLEMENTED`: feasible candidate with no currently published TUI capability.
 - `BACKEND_DEPENDENT`: support varies by platform, authorization, subscription, or selected backend.
 - `UNAVAILABLE`: no documented, reliable integration found for the planned architecture.
+
+## Current product-gap assessment — local Music.app mode
+
+This is the current product truth for `--backend macos`, not a promise based on
+an API declaration. `LOCAL_ONLY` means the feature is useful without Apple
+credentials but is intentionally scoped to the installed Music.app library;
+`REQUIRES_APPLE_API` means that the desktop-style network/catalog experience
+cannot be truthfully supplied by the local scripting dictionary. `NOT_YET_IMPLEMENTED`
+items are candidates, not published capabilities.
+
+| Desktop Music.app area | Current TUI product status | Evidence / boundary | Route |
+|---|---|---|---|
+| Listen Now | `REQUIRES_APPLE_API` | No local recommendation/history feed | Optional Apple Music API |
+| Browse, charts, genres | `REQUIRES_APPLE_API` | Music.app scripting reads the owned library, not catalog/discovery | Apple Music API |
+| Radio and station discovery | `REQUIRES_APPLE_API` | No verified local station catalog or safe creation surface | Apple Music API plus authorized player |
+| Local library search | `SUPPORTED` | Immediate normalized in-memory search over cached/refreshing tracks, albums, artists, and playlists | Maintain locally |
+| Catalog search | `REQUIRES_APPLE_API` | No local catalog query surface | Apple Music API |
+| Songs | `SUPPORTED` | Progressive authoritative scan, last-known cache, stable IDs, cloud/local tracks | Maintain locally |
+| Artists and Albums | `PARTIAL` | Correctly derived from track metadata rather than first-class Music.app collections | Local sorting/filtering/metadata |
+| Recently Added | `LOCAL_ONLY` | Derived from local `dateAdded`, not an Apple cloud endpoint | Maintain locally |
+| Recently Played / History | `PARTIAL` | Local `playedDate`/count is useful, but is not a complete event history | API needed for cloud history parity |
+| Made for You | `REQUIRES_APPLE_API` | No verified local recommendation source | Apple Music API |
+| Playlists and folders | `SUPPORTED` | Stable-ID hierarchy, lazy contents, detail views, exact playback | Maintain locally |
+| Smart playlists | `PARTIAL` | Classified/readable and contents can be read; rules are not exposed | Keep read-only |
+| Playlist editing / create / rename / delete / add/remove / reorder | `UNAVAILABLE` | Write probes were non-transactional; JXA creation failed, smart creation was wrong, and reorder did not change order | Intentionally deferred |
+| Play/pause, next/previous, seek, volume, shuffle, repeat | `SUPPORTED` | Live-verified Apple Events and authoritative poll reconciliation | Maintain locally |
+| Continuous playlist and album playback | `SUPPORTED` | Stable-ID synthesized sessions preserve Music.app authority and measured 0.2–0.3 s transitions | Maintain; do not redesign casually |
+| Queue / Up Next / Play Next / Play Later / reorder | `UNAVAILABLE` | Installed public dictionary has no corresponding read/write surface | Do not emulate |
+| Track metadata | `PARTIAL` | Title, artist, album, album artist, year, genre, duration, counts, dates, rating, favorite, cloud status, and media kind are parsed; presentation is selective | Local detail/list UX |
+| Ratings and favorites | `PARTIAL` | Read state is parsed; writes are intentionally disabled and unverified | Display locally; defer writes |
+| Artwork and Now Playing | `SUPPORTED` | Lazy bounded Music.app extraction with terminal renderer/fallback | Maintain locally |
+| Full-screen Now Playing | `SUPPORTED` | History-backed `N` route reuses authoritative playback state and the shared artwork cache/renderer | Maintain locally |
+| Lyrics / timed lyrics | `PARTIAL` / `UNAVAILABLE` | Plain `lyrics` may be available but is not implemented; timed payload is absent | Research plain local read; timed unavailable |
+| Audio quality, Lossless, Atmos indicators | `REQUIRES_APPLE_API` | No reliable scripting-dictionary quality/variant flags | Apple Music API metadata |
+| Music videos | `NOT_YET_IMPLEMENTED` | `mediaKind` is parsed, but no verified local video/detail UX exists | Low-priority research |
+| Sorting and local filters | `SUPPORTED` | Runtime-only stable-ID index views compose case-insensitive local filters with deterministic sorts during cache/live reconciliation | Local-only; preferences are not persisted |
+| Context actions, keyboard navigation, Help | `SUPPORTED` | Typed stable-ID actions, modal menu, Help, responsive navigation | Maintain locally |
+| Responsive layout, loading/error/cache states | `SUPPORTED` | Windowed lists, explicit load states, cache hydration/reconciliation, safe errors | Maintain locally |
+| Manual refresh / cache controls | `SUPPORTED` | `R` starts one coalesced background authoritative scan; `cache-status`/`cache-clear` inspect or remove only the versioned metadata snapshot | Local-only; playback and artwork remain untouched |
+| Settings/theme/keybinding/mouse UI | `NOT_YET_IMPLEMENTED` | No settings model, theme switcher, configurable keymap, or mouse path | Lower-priority local UX |
+| Offline/local-only behavior | `LOCAL_ONLY` | Cached metadata remains navigable; Music.app remains authoritative for actual availability | Document accurately |
 
 ## Local Music.app only — no Apple Developer account
 
@@ -31,22 +75,22 @@ Local statuses are stricter than dictionary availability:
 | Volume | Read/write `soundVolume` worked live | Five-point volume controls | `SUPPORTED` |
 | Shuffle | Read/write application shuffle state worked live | Toggle control | `SUPPORTED` |
 | Repeat | Read/write `songRepeat` worked live, with asynchronous Music.app application | Cycle off/all/one and reconcile | `SUPPORTED` |
-| Library songs | Library-playlist track ranges and selected property arrays worked live | Progressive 200-track batches and Songs view | `SUPPORTED` |
+| Library songs | Library-playlist track ranges and selected property arrays worked live | Progressive, profiled 400-track batches and windowed Songs view | `SUPPORTED` |
 | Library albums | No first-class complete album collection is needed; album and album-artist fields worked | Stable composite grouping derived from loaded tracks | `PARTIAL` |
 | Library artists | Artist and album-artist fields worked; no efficient canonical artist collection was found | Normalized grouping derived from loaded tracks | `PARTIAL` |
 | Library playlists | Playlist classes/properties and bulk discovery worked live | Real user/system/subscription playlists | `SUPPORTED` |
-| Playlist folders | Folder class and parent relationships are readable | Kind/parent preserved; flattened display, no expand/collapse yet | `READ_ONLY` |
+| Playlist folders | Folder class and parent relationships worked live, including nested children | Stable-ID hierarchy with distinct folder rows, indentation, and expand/collapse | `SUPPORTED` |
 | Smart playlists | User-playlist `smart` flag and contents are readable | Classified and readable; rules are never reverse-engineered or edited | `READ_ONLY` |
-| Playlist contents | Track object specifiers worked; some concrete playlists require selected-property fallback | Lazy bounded batches with a 20-item fallback cap | `SUPPORTED` |
-| Create playlist | Generic `make` exists, but source/editability behavior was not safely verified | Disabled | `UNAVAILABLE` |
-| Rename playlist | Playlist name is declared writable, but duplicate/stale/editability and rollback behavior was not verified | Disabled | `UNAVAILABLE` |
-| Delete playlist | Generic `delete` exists, but destructive runtime behavior was intentionally not exercised | Disabled | `UNAVAILABLE` |
-| Add track to playlist | File `add` and object duplication exist, but no reliable audited cloud/library identity append was proven | Disabled | `UNAVAILABLE` |
-| Remove track from playlist | Generic deletion is not sufficient proof of safe editable-playlist removal | Disabled | `UNAVAILABLE` |
-| Reorder playlist tracks | No explicit reliable track-order command was found or verified | Disabled | `UNAVAILABLE` |
-| Play selected track | `play(trackSpecifier)` worked with persistent/database-ID lookup | Exact library or playlist-context playback | `SUPPORTED` |
+| Playlist contents | Track object specifiers worked; some concrete playlists require selected-property fallback | Explicit per-playlist loading/partial/loaded/empty/error state, foreground bounded batches, and a 20-item fallback cap | `SUPPORTED` |
+| Create playlist | Temporary AppleScript creation worked, but the JXA `make` path used by this backend returned `-1708`; smart creation silently produced a regular playlist | Research only; disabled | `UNAVAILABLE` |
+| Rename playlist | Temporary rename preserved persistent ID, including when duplicate display names had distinct IDs | Research only; disabled pending editability, confirmation, and rollback design | `UNAVAILABLE` |
+| Delete playlist | Deleting only test-created playlists worked immediately and displayed no Music.app confirmation | Research only; disabled; any future UI must confirm first | `UNAVAILABLE` |
+| Add track to playlist | `duplicate` added exact uploaded and subscription track identities to a test-created playlist; dictionary `add` remains file-only | Research only; disabled pending a dedicated safe write adapter | `UNAVAILABLE` |
+| Remove track from playlist | Deleting a playlist entry leaves the library object intact | Supported only for normal editable user playlists with in-TUI confirmation; playlist ID, displayed occurrence index, and expected stable track ID detect stale contents | `SUPPORTED` |
+| Reorder playlist tracks | A documented `move` request accepted a track operand but left the two-track order unchanged | Disabled as unreliable | `UNAVAILABLE` |
+| Play selected track | `play(trackSpecifier)` worked with persistent/database-ID lookup but an isolated playlist track did not continue naturally | Exact library playback; selected playlist tracks create a synthesized stable-ID continuation context | `SUPPORTED` |
 | Play selected playlist | `play(playlistSpecifier)` worked with persistent-ID lookup | `P` plays the selected real playlist | `SUPPORTED` |
-| Play album | No reliable album-context playback operation was verified | Individual album tracks can play; whole-album action is disabled | `PARTIAL` |
+| Play album | Music.app rejects an array of track specifiers; `play(track, once: true)` worked live | `P` starts a synthesized exact-ID session in disc/track order; next/previous stay within it and polling advances after a stopped track | `SUPPORTED` |
 | Track rating | Track rating is readable; writes were not exercised | Parsed as optional 0–100 legacy rating metadata | `READ_ONLY` |
 | Favorite/love | Current dictionary exposes `favorited`; legacy/current semantic equivalence is not assumed | Parsed from the property using Music.app's own “favorited” name; writes disabled | `READ_ONLY` |
 | Play count | `playedCount` worked as a nullable/coercible track field | Parsed and retained as metadata | `READ_ONLY` |
@@ -54,9 +98,9 @@ Local statuses are stricter than dictionary availability:
 | Genre | Track genre worked, including empty/missing values | Parsed, displayed where applicable, and indexed for search | `READ_ONLY` |
 | Year | Track year worked as a nullable/coercible numeric field | Parsed and used for album metadata | `READ_ONLY` |
 | Composer | Track composer worked, including empty/missing values | Parsed and indexed for search | `READ_ONLY` |
-| Artwork | Artwork objects exist, but eager bytes would be expensive and lazy retrieval was not live-qualified | No artwork reads during library loading; renderer deferred | `PARTIAL` |
+| Artwork | First artwork `rawData` descriptors worked live and are decoded with a 2 MiB extraction limit | Lazy album-deduplicated 16-entry memory cache; bounded iTerm2 and PNG-Kitty inline output; Sixel, unsupported Kitty formats, missing, and large images use Unicode fallback | `PARTIAL` |
 | Recently added | Real `dateAdded` values worked | Local album view sorted by newest available date | `SUPPORTED` |
-| Recently played | Played date/count are readable, but they are not a complete event history | Metadata retained; dedicated history view deferred | `PARTIAL` |
+| Recently played | Played date/count worked and can be sorted/deduplicated by stable track ID, but are not a complete event history | Dedicated `Local Music.app` view, newest real played date first | `PARTIAL` |
 | Queue read | Installed definition exposes current playlist, not Music.app Up Next | Disabled | `UNAVAILABLE` |
 | Queue write | No installed public Up Next mutation surface | Disabled | `UNAVAILABLE` |
 | Play Next | No installed public command | Disabled | `UNAVAILABLE` |
@@ -136,10 +180,13 @@ The installed Music.app 1.6.5 scripting definition and live JXA behavior were re
 | Current playlist | Read-only and described as the playlist containing the targeted track | Not treated as Up Next |
 | Up Next, Play Next/Later, queue reorder | No corresponding class, property, or command exists in the installed definition | Unsupported; all production queue capabilities disabled |
 | Library tracks/playlists | Bulk playlist properties and bounded track property arrays were live-verified; some concrete playlist ranges need selected-property per-track fallback | Implemented progressively with explicit local source/loading state |
-| Selected item playback | `play` accepts track or playlist specifiers; `whose` resolves persistent/database identifiers | Implemented for library tracks, playlist-context tracks, and playlists; normal user-playlist path live-verified |
+| Playlist hierarchy | Folder class and parent playlist properties were live-verified | Stable-ID expandable tree; nested playlist detail uses the standard lazy-load route |
+| Selected item playback | `play` accepts track or playlist specifiers; exact selected playlist objects stop without a retained continuation context | Library tracks use exact lookup; playlist tracks and albums use synthesized stable-ID sessions; native whole-playlist `P` remains separate |
+| Artwork | First artwork `rawData` returned bounded JPEG bytes in the live probe | Lazy album cache plus iTerm2/PNG-Kitty/Unicode terminal abstraction |
+| Recently Played | Real played date/count values were present and ordered consistently | Dedicated local-only history view; not cloud Listen Now history |
 | Favorites and ratings | Writable properties are documented, but mutation behavior was not exercised for this milestone | Capability remains disabled until dedicated mutation tests exist |
 
-The 2026-08-03 runtime audits exercised the real TUI and installed library: startup playback synchronization; external state/seek changes; TUI playback controls; 107 discovered playlists; bounded loading of a 12,997-track library; real user-playlist names, track metadata, navigation, and contextual playback; selected playlist playback; progressive status; and clean TUI shutdown. Normal tests remain fixture-only, while three explicit live tests are ignored by default.
+The 2026-08-03 runtime audits exercised the real TUI and installed library: startup playback synchronization; external state/seek changes; TUI playback controls; 107 discovered hierarchical playlists; bounded loading of a 12,997-track library; real user-playlist names, explicit progressive playlist status, track metadata, nested navigation, contextual/playlist/album playback, two consecutive natural cloud-playlist transitions, external context cancellation, artwork extraction/fallback, local Recently Played, progressive status, and clean TUI shutdown. A 2026-08-09 focused live audit then verified three consecutive transitions in a cloud-containing playlist with a 0.18–0.32 second post-audio gap. Normal tests remain fixture-only, while ten explicit live tests are ignored by default.
 
 ## Verified constraints
 

@@ -25,7 +25,41 @@ pub struct RawMusicState {
     #[serde(default)]
     pub playlist_batch: Option<RawPlaylistTrackBatch>,
     #[serde(default)]
+    pub artwork: Option<RawArtwork>,
+    #[serde(default)]
+    pub profile: Option<RawProfileMetrics>,
+    #[serde(default)]
+    pub session_advanced: bool,
+    #[serde(default)]
     pub error: Option<RawScriptError>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawProfileMetrics {
+    pub collection_ms: f64,
+    pub serialization_ms: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RawArtwork {
+    #[serde(default)]
+    pub raw_data: Option<String>,
+    #[serde(default)]
+    pub missing: bool,
+    #[serde(default)]
+    pub too_large: bool,
+    #[serde(default)]
+    pub encoded_bytes: Option<usize>,
+    #[serde(default)]
+    pub resolver: Option<String>,
+    #[serde(default)]
+    pub attempts: Vec<String>,
+    #[serde(default)]
+    pub transient: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

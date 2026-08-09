@@ -48,6 +48,9 @@ pub enum CliAction {
     Run(BackendChoice),
     Auth(AuthCommand),
     Doctor,
+    CacheStatus,
+    CacheClear,
+    ArtworkTest,
     ConfigPath,
     Help,
     Version,
@@ -92,6 +95,24 @@ impl CliAction {
             return Ok(Self::Doctor);
         }
 
+        if arguments.peek().map(String::as_str) == Some("cache-status") {
+            arguments.next();
+            reject_trailing(arguments)?;
+            return Ok(Self::CacheStatus);
+        }
+
+        if arguments.peek().map(String::as_str) == Some("cache-clear") {
+            arguments.next();
+            reject_trailing(arguments)?;
+            return Ok(Self::CacheClear);
+        }
+
+        if arguments.peek().map(String::as_str) == Some("artwork-test") {
+            arguments.next();
+            reject_trailing(arguments)?;
+            return Ok(Self::ArtworkTest);
+        }
+
         if arguments.peek().map(String::as_str) == Some("config-path") {
             arguments.next();
             reject_trailing(arguments)?;
@@ -125,7 +146,7 @@ impl CliAction {
 
     #[must_use]
     pub const fn help_text() -> &'static str {
-        "apple-music-tui\n\nUSAGE:\n    apple-music-tui --backend <auto|mock|macos>\n    apple-music-tui auth [status|logout]\n    apple-music-tui doctor\n    apple-music-tui config-path\n\nOPTIONS:\n    --backend <auto|mock|macos|apple>\n    -h, --help\n    -V, --version\n\nOn macOS, auto selects the local Music.app playback backend.\nThe apple HTTP content backend is reserved for Milestone 4."
+        "apple-music-tui\n\nUSAGE:\n    apple-music-tui --backend <auto|mock|macos>\n    apple-music-tui auth [status|logout]\n    apple-music-tui doctor\n    apple-music-tui cache-status\n    apple-music-tui cache-clear\n    apple-music-tui artwork-test\n    apple-music-tui config-path\n\nOPTIONS:\n    --backend <auto|mock|macos|apple>\n    -h, --help\n    -V, --version\n\nOn macOS, auto selects the local Music.app playback backend.\nThe apple HTTP content backend is reserved for Milestone 4."
     }
 }
 
@@ -172,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_auth_doctor_and_config_path_commands() {
+    fn routes_auth_doctor_cache_and_config_path_commands() {
         assert_eq!(
             CliAction::parse_from(["auth"]).expect("auth"),
             CliAction::Auth(AuthCommand::Login)
@@ -188,6 +209,18 @@ mod tests {
         assert_eq!(
             CliAction::parse_from(["doctor"]).expect("doctor"),
             CliAction::Doctor
+        );
+        assert_eq!(
+            CliAction::parse_from(["cache-status"]).expect("cache status"),
+            CliAction::CacheStatus
+        );
+        assert_eq!(
+            CliAction::parse_from(["cache-clear"]).expect("cache clear"),
+            CliAction::CacheClear
+        );
+        assert_eq!(
+            CliAction::parse_from(["artwork-test"]).expect("artwork test"),
+            CliAction::ArtworkTest
         );
         assert_eq!(
             CliAction::parse_from(["config-path"]).expect("config path"),

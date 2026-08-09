@@ -1,4 +1,9 @@
-use std::{fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TrackId(String);
@@ -110,6 +115,47 @@ impl ArtistId {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ArtworkKey {
+    Album(AlbumId),
+    Track(TrackId),
+    Playlist(PlaylistId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArtworkMediaType {
+    Jpeg,
+    Png,
+    Gif,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Artwork {
+    pub media_type: ArtworkMediaType,
+    pub bytes: Vec<u8>,
+}
+
+impl Artwork {
+    /// Identifies a source asset while an asynchronous renderable conversion is in flight.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.media_type.hash(&mut hasher);
+        self.bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtworkResult {
+    Ready(Artwork),
+    Missing,
+    Transient(String),
+    TooLarge { encoded_bytes: usize },
+    Invalid(String),
+}
+
 impl fmt::Display for ArtistId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -186,6 +232,15 @@ pub struct Track {
     pub duration: Duration,
     pub is_favorite: bool,
     pub metadata: TrackMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentlyPlayedEntry {
+    pub track_id: TrackId,
+    pub title: String,
+    pub artist: String,
+    pub play_count: Option<u64>,
+    pub played_at: String,
 }
 
 impl Track {
@@ -267,10 +322,156 @@ pub struct Playlist {
     pub description: Option<String>,
     pub tracks: Vec<Track>,
     pub track_count: usize,
-    pub tracks_loaded: bool,
+    pub contents_state: PlaylistLoadState,
     pub kind: PlaylistKind,
     pub parent_id: Option<PlaylistId>,
     pub origin: DataOrigin,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PlaylistLoadState {
+    #[default]
+    NotLoaded,
+    Loading {
+        loaded: usize,
+        total: Option<usize>,
+    },
+    PartiallyLoaded {
+        loaded: usize,
+        total: usize,
+    },
+    Loaded {
+        total: usize,
+    },
+    Empty,
+    Error(String),
+}
+
+impl PlaylistLoadState {
+    #[must_use]
+    pub const fn should_request_load(&self) -> bool {
+        matches!(self, Self::NotLoaded | Self::Error(_))
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Loaded { .. } | Self::Empty)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaylistTreeNode {
+    pub playlist_id: PlaylistId,
+    pub children: Vec<Self>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlaylistHierarchy {
+    pub roots: Vec<PlaylistTreeNode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisiblePlaylistEntry {
+    pub playlist_id: PlaylistId,
+    pub depth: usize,
+    pub has_children: bool,
+}
+
+impl PlaylistHierarchy {
+    #[must_use]
+    pub fn from_playlists(playlists: &[Playlist]) -> Self {
+        let known_ids = playlists
+            .iter()
+            .map(|playlist| playlist.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut root_ids = Vec::new();
+        let mut children_by_parent = BTreeMap::<PlaylistId, Vec<PlaylistId>>::new();
+        for playlist in playlists {
+            match playlist.parent_id.as_ref() {
+                Some(parent_id) if parent_id != &playlist.id && known_ids.contains(parent_id) => {
+                    children_by_parent
+                        .entry(parent_id.clone())
+                        .or_default()
+                        .push(playlist.id.clone());
+                }
+                _ => root_ids.push(playlist.id.clone()),
+            }
+        }
+
+        let mut emitted = BTreeSet::new();
+        let mut roots = root_ids
+            .iter()
+            .filter_map(|id| {
+                build_playlist_node(id, &children_by_parent, &mut BTreeSet::new(), &mut emitted)
+            })
+            .collect::<Vec<_>>();
+        for playlist in playlists {
+            if !emitted.contains(&playlist.id)
+                && let Some(node) = build_playlist_node(
+                    &playlist.id,
+                    &children_by_parent,
+                    &mut BTreeSet::new(),
+                    &mut emitted,
+                )
+            {
+                roots.push(node);
+            }
+        }
+        Self { roots }
+    }
+
+    #[must_use]
+    pub fn visible_entries(
+        &self,
+        expanded_folders: &BTreeSet<PlaylistId>,
+    ) -> Vec<VisiblePlaylistEntry> {
+        let mut entries = Vec::new();
+        for root in &self.roots {
+            append_visible_playlist_entries(root, 0, expanded_folders, &mut entries);
+        }
+        entries
+    }
+}
+
+fn build_playlist_node(
+    id: &PlaylistId,
+    children_by_parent: &BTreeMap<PlaylistId, Vec<PlaylistId>>,
+    visiting: &mut BTreeSet<PlaylistId>,
+    emitted: &mut BTreeSet<PlaylistId>,
+) -> Option<PlaylistTreeNode> {
+    if emitted.contains(id) || !visiting.insert(id.clone()) {
+        return None;
+    }
+    let children = children_by_parent
+        .get(id)
+        .into_iter()
+        .flatten()
+        .filter_map(|child_id| build_playlist_node(child_id, children_by_parent, visiting, emitted))
+        .collect();
+    visiting.remove(id);
+    emitted.insert(id.clone());
+    Some(PlaylistTreeNode {
+        playlist_id: id.clone(),
+        children,
+    })
+}
+
+fn append_visible_playlist_entries(
+    node: &PlaylistTreeNode,
+    depth: usize,
+    expanded_folders: &BTreeSet<PlaylistId>,
+    entries: &mut Vec<VisiblePlaylistEntry>,
+) {
+    entries.push(VisiblePlaylistEntry {
+        playlist_id: node.playlist_id.clone(),
+        depth,
+        has_children: !node.children.is_empty(),
+    });
+    if expanded_folders.contains(&node.playlist_id) {
+        for child in &node.children {
+            append_visible_playlist_entries(child, depth + 1, expanded_folders, entries);
+        }
+    }
 }
 
 impl Playlist {
@@ -288,7 +489,11 @@ impl Playlist {
             description,
             tracks,
             track_count,
-            tracks_loaded: true,
+            contents_state: if track_count == 0 {
+                PlaylistLoadState::Empty
+            } else {
+                PlaylistLoadState::Loaded { total: track_count }
+            },
             kind: PlaylistKind::User,
             parent_id: None,
             origin: DataOrigin::Demo,
@@ -309,7 +514,7 @@ impl Playlist {
             description,
             tracks: Vec::new(),
             track_count: 0,
-            tracks_loaded: false,
+            contents_state: PlaylistLoadState::NotLoaded,
             kind,
             parent_id,
             origin: DataOrigin::LocalMusicApp,
@@ -432,6 +637,24 @@ pub struct PlaybackSnapshot {
     pub muted: bool,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    pub context: PlaybackContext,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PlaybackContext {
+    #[default]
+    NoContext,
+    Playlist {
+        playlist_id: PlaylistId,
+        ordered_track_ids: Vec<TrackId>,
+        current_index: usize,
+        complete: bool,
+    },
+    Album {
+        album_id: AlbumId,
+        ordered_track_ids: Vec<TrackId>,
+        current_index: usize,
+    },
 }
 
 impl Default for PlaybackSnapshot {
@@ -445,6 +668,7 @@ impl Default for PlaybackSnapshot {
             muted: false,
             shuffle: false,
             repeat: RepeatMode::Off,
+            context: PlaybackContext::NoContext,
         }
     }
 }
@@ -479,6 +703,13 @@ pub enum BackendAvailability {
 pub enum CollectionLoadState {
     #[default]
     NotStarted,
+    Cached {
+        total: usize,
+    },
+    Refreshing {
+        loaded: usize,
+        total: usize,
+    },
     Loading {
         loaded: usize,
         total: usize,
@@ -498,6 +729,7 @@ pub struct BackendSnapshot {
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
     pub recently_added: Vec<Album>,
+    pub recently_played: Vec<RecentlyPlayedEntry>,
     pub stations: Vec<Station>,
     pub playlists: Vec<Playlist>,
     pub library_status: CollectionLoadState,
