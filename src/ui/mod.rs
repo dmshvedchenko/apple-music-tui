@@ -2845,7 +2845,7 @@ mod tests {
 
     #[test]
     fn full_now_playing_renders_the_reconciled_collection_position() {
-        let ordered_track_ids = (1..=100)
+        let ordered_track_ids = (1..=61)
             .map(|index| TrackId::new(format!("track-{index}")))
             .collect::<Vec<_>>();
         let state = AppState {
@@ -2855,8 +2855,8 @@ mod tests {
             },
             playback: PlaybackSnapshot {
                 current_track: Some(Track::new(
-                    "track-37",
-                    "Thirty Seven",
+                    "track-6",
+                    "Six",
                     "Artist",
                     "Album",
                     Duration::from_secs(60),
@@ -2864,7 +2864,7 @@ mod tests {
                 context: PlaybackContext::Playlist {
                     playlist_id: PlaylistId::new("playlist"),
                     ordered_track_ids,
-                    current_index: 36,
+                    current_index: 5,
                     complete: true,
                 },
                 ..PlaybackSnapshot::default()
@@ -2872,7 +2872,7 @@ mod tests {
             ..AppState::default()
         };
 
-        assert!(render_text_at(&state, 110, 32).contains("Playlist · 37 / 100"));
+        assert!(render_text_at(&state, 110, 32).contains("Playlist · 6 / 61"));
     }
 
     #[test]

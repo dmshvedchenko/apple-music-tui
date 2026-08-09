@@ -675,11 +675,21 @@ impl MacOsMusicBackend {
             .shuffle
             .then(|| playlist_shuffle_seed(&playlist_id));
         if let Some(seed) = shuffle_seed {
-            let selected = tracks.remove(session_index);
-            tracks.sort_by_key(|track| shuffled_track_rank(seed, track));
-            tracks.insert(0, selected);
-            session_index = 0;
+            // Keep the selected stable track at its real session position.  Only the
+            // unplayed tail is shuffled; prior entries remain history rather than becoming
+            // future candidates again.
+            let mut future = tracks.split_off(session_index.saturating_add(1));
+            let canonical_future = future.clone();
+            future.sort_by_key(|track| shuffled_track_rank(seed, track));
+            if future.len() > 1 && future == canonical_future {
+                future.rotate_left(1);
+            }
+            tracks.extend(future);
         }
+        session_index = tracks
+            .iter()
+            .position(|track| track.id == selected_id)
+            .ok_or_else(|| BackendError::TrackNotFound(selected_id.clone()))?;
         self.playback_session = Some(PlaybackSession {
             source: PlaybackSessionSource::Playlist {
                 playlist_id,
@@ -3120,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_shuffle_is_one_backend_owned_stable_id_order() {
+    fn selected_playlist_track_initializes_its_real_session_position() {
         let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([]));
         let playlist_id = PlaylistId::new("musicapp:playlist:persistent:SHUFFLE");
         let expected_ids = ["T1", "T2", "T3", "T4"]
@@ -3143,14 +3153,72 @@ mod tests {
             panic!("playlist context")
         };
         assert_eq!(actual_playlist_id, playlist_id);
-        assert_eq!(current_index, 0);
+        assert_eq!(current_index, 2);
         assert!(complete);
-        assert_eq!(ordered_track_ids[0], expected_ids[2]);
+        assert_eq!(ordered_track_ids[2], expected_ids[2]);
         let mut actual_set = ordered_track_ids;
         actual_set.sort();
         let mut expected_set = expected_ids;
         expected_set.sort();
         assert_eq!(actual_set, expected_set);
+    }
+
+    #[test]
+    fn playlist_session_initializes_first_and_sixth_selected_tracks() {
+        let ids = (1..=6)
+            .map(|index| TrackId::new(format!("musicapp:persistent:T{index}")))
+            .collect::<Vec<_>>();
+        for (selected_index, expected_index) in [(0, 0), (5, 5)] {
+            let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([]));
+            let mut backend = MacOsMusicBackend::with_runner(runner, true);
+            backend
+                .create_playlist_session(
+                    PlaylistId::new("musicapp:playlist:persistent:P"),
+                    ids.clone(),
+                    selected_index,
+                    true,
+                )
+                .expect("create playlist session");
+            assert_eq!(
+                backend.playback_session.as_ref().expect("session").index,
+                expected_index
+            );
+        }
+    }
+
+    #[test]
+    fn shuffled_playlist_session_keeps_history_current_and_future_for_selected_sixth_track() {
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+        backend.snapshot.playback.shuffle = true;
+        backend
+            .create_playlist_session(
+                PlaylistId::new("musicapp:playlist:persistent:P"),
+                (1..=10)
+                    .map(|index| TrackId::new(format!("musicapp:persistent:T{index}")))
+                    .collect(),
+                5,
+                true,
+            )
+            .expect("create shuffled playlist session");
+        let session = backend.playback_session.as_ref().expect("session");
+        assert_eq!(session.index, 5);
+        assert_eq!(
+            session.tracks[session.index].id,
+            TrackId::new("musicapp:persistent:T6")
+        );
+        assert_eq!(
+            session.tracks[..session.index]
+                .iter()
+                .map(|track| track.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert!(
+            session.tracks[session.index + 1..]
+                .iter()
+                .all(|track| track.source_index > 5)
+        );
     }
 
     #[test]
