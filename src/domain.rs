@@ -648,6 +648,9 @@ pub enum PlaybackContext {
         playlist_id: PlaylistId,
         ordered_track_ids: Vec<TrackId>,
         current_index: usize,
+        /// Canonical playlist occurrence currently played. This remains stable even when
+        /// `ordered_track_ids` is a shuffled session order and IDs are duplicated.
+        current_source_index: usize,
         complete: bool,
     },
     Album {

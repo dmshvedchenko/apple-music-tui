@@ -18,6 +18,7 @@ pub enum Action {
     MoveDown,
     JumpToStart,
     JumpToEnd,
+    JumpToPlayingTrack,
     PageUp,
     PageDown,
     FocusLeft,

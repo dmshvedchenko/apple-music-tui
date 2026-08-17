@@ -80,12 +80,14 @@ fn run_osascript(script: &str) -> Result<String, AutomationError> {
         time::Instant,
     };
 
+    let spawn_started = Instant::now();
     let mut child = Command::new("/usr/bin/osascript")
         .args(["-l", "JavaScript", "-e", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| AutomationError::Spawn(error.to_string()))?;
+    let spawn_elapsed = spawn_started.elapsed();
     let stdout = child
         .stdout
         .take()
@@ -104,7 +106,8 @@ fn run_osascript(script: &str) -> Result<String, AutomationError> {
         let mut pipe = stderr;
         pipe.read_to_end(&mut bytes).map(|_| bytes)
     });
-    let deadline = Instant::now() + AUTOMATION_TIMEOUT;
+    let wait_started = Instant::now();
+    let deadline = wait_started + AUTOMATION_TIMEOUT;
 
     let status = loop {
         if let Some(status) = child
@@ -137,6 +140,12 @@ fn run_osascript(script: &str) -> Result<String, AutomationError> {
             stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         });
     }
+    tracing::debug!(
+        process_spawn_ms = spawn_elapsed.as_secs_f64() * 1_000.0,
+        process_wait_ms = wait_started.elapsed().as_secs_f64() * 1_000.0,
+        stdout_bytes = stdout.len(),
+        "osascript process timing"
+    );
     String::from_utf8(stdout).map_err(|_| AutomationError::InvalidUtf8)
 }
 

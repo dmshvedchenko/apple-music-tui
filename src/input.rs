@@ -60,6 +60,7 @@ enum BindingAction {
     MoveDown,
     JumpToStart,
     JumpToEnd,
+    JumpToPlayingTrack,
     PageUp,
     PageDown,
     FocusLeft,
@@ -101,6 +102,7 @@ impl BindingAction {
             Self::MoveDown => Some(Action::MoveDown),
             Self::JumpToStart => Some(Action::JumpToStart),
             Self::JumpToEnd => Some(Action::JumpToEnd),
+            Self::JumpToPlayingTrack => Some(Action::JumpToPlayingTrack),
             Self::PageUp => Some(Action::PageUp),
             Self::PageDown => Some(Action::PageDown),
             Self::FocusLeft => Some(Action::FocusLeft),
@@ -167,6 +169,13 @@ const BINDINGS: &[KeyBinding] = &[
         group: BindingGroup::Navigation,
         matches: &[KeyMatch::Character('G'), KeyMatch::Code(KeyCode::End)],
         action: BindingAction::JumpToEnd,
+    },
+    KeyBinding {
+        keys: ".",
+        description: "jump to playing playlist track",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('.')],
+        action: BindingAction::JumpToPlayingTrack,
     },
     KeyBinding {
         keys: "Ctrl-u / PgUp",
@@ -531,6 +540,10 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             Some(Action::JumpToEnd)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE)),
+            Some(Action::JumpToPlayingTrack)
         );
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),

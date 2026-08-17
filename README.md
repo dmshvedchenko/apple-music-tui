@@ -205,6 +205,7 @@ Key Action
 `gg/G` First/last item
 `Enter` Open or play
 `P` Play playlist/album
+`.` Jump to currently playing playlist track
 `N` Full-screen Now Playing
 `n/p` Next/previous track
 `Space` Play/pause

@@ -257,8 +257,15 @@ impl MockMusicBackend {
             .get(self.current_index)
             .map(|item| item.track.clone());
         match &mut self.playback.context {
-            PlaybackContext::Playlist { current_index, .. }
-            | PlaybackContext::Album { current_index, .. } => {
+            PlaybackContext::Playlist {
+                current_index,
+                current_source_index,
+                ..
+            } => {
+                *current_index = self.current_index;
+                *current_source_index = self.current_index;
+            }
+            PlaybackContext::Album { current_index, .. } => {
                 *current_index = self.current_index;
             }
             PlaybackContext::NoContext => {}
@@ -333,6 +340,7 @@ impl MockMusicBackend {
             playlist_id: playlist_id.clone(),
             ordered_track_ids,
             current_index: 0,
+            current_source_index: 0,
             complete: true,
         };
         self.select_current();
@@ -377,6 +385,7 @@ impl MockMusicBackend {
             playlist_id: playlist_id.clone(),
             ordered_track_ids: ordered_track_ids.to_vec(),
             current_index: selected_index,
+            current_source_index: selected_index,
             complete,
         };
         self.select_current();
@@ -929,6 +938,7 @@ mod tests {
                 playlist_id: PlaylistId::new("mock-playlist-terminal-focus"),
                 ordered_track_ids,
                 current_index: 2,
+                current_source_index: 2,
                 complete: true,
             }
         );

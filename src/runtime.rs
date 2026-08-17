@@ -16,7 +16,7 @@ use crate::{
         state::AppState,
     },
     auth::AuthStatus,
-    backend::{MusicBackend, spawn_worker},
+    backend::{MusicBackend, is_interactive_command, spawn_worker},
     error::AppError,
     input::{map_collection_filter_key, map_key, map_search_key},
     terminal::AppTerminal,
@@ -97,10 +97,19 @@ pub async fn run<B: MusicBackend>(
         };
 
         if let Some(action) = action {
+            let action_started = Instant::now();
             let commands = reduce(&mut state, action);
             for command in commands {
                 match command {
                     Command::Backend(command) => {
+                        if is_interactive_command(&command) {
+                            tracing::debug!(
+                                ?command,
+                                input_to_dispatch_ms =
+                                    action_started.elapsed().as_secs_f64() * 1_000.0,
+                                "interactive command dispatched"
+                            );
+                        }
                         if command_sender.send(command).await.is_err() {
                             state.notification =
                                 Some("Backend worker stopped unexpectedly".to_owned());

@@ -210,6 +210,7 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Command> {
         Action::MoveDown => move_selection(state, true),
         Action::JumpToStart => jump_selection(state, false),
         Action::JumpToEnd => jump_selection(state, true),
+        Action::JumpToPlayingTrack => jump_to_playing_playlist_track(state),
         Action::PageUp => page_selection(state, false),
         Action::PageDown => page_selection(state, true),
         Action::FocusLeft => {
@@ -757,6 +758,37 @@ fn open_action_menu(state: &mut AppState) {
         actions,
         selection: 0,
     });
+}
+
+/// Select the canonical playlist occurrence published by the active playback session.
+///
+/// `current_source_index` is distinct from the session's playback-order index: under
+/// shuffle it still identifies the exact row in Music.app playlist order, including a
+/// duplicate track occurrence. This is deliberately an explicit navigation action; backend
+/// updates never call it, so browsing selection remains under user control.
+fn jump_to_playing_playlist_track(state: &mut AppState) {
+    let Route::PlaylistDetail { playlist_id } = &state.navigation.active else {
+        return;
+    };
+    let crate::domain::PlaybackContext::Playlist {
+        playlist_id: context_playlist_id,
+        current_source_index,
+        ..
+    } = &state.playback.context
+    else {
+        return;
+    };
+    if context_playlist_id != playlist_id {
+        return;
+    }
+    let Some(playlist) = playlist_by_id(state, playlist_id) else {
+        return;
+    };
+    // A partially loaded playlist simply has no row to reveal yet. Do not turn this
+    // navigation action into a new Music.app request.
+    if *current_source_index < playlist.tracks.len() {
+        state.content_selection = *current_source_index;
+    }
 }
 
 fn request_playlist_track_removal(state: &mut AppState) -> Vec<Command> {
@@ -2432,8 +2464,8 @@ mod tests {
         },
         domain::{
             Album, AlbumId, Artist, ArtistId, Artwork, ArtworkKey, ArtworkMediaType, ArtworkResult,
-            BackendSnapshot, PlaybackSnapshot, PlaybackStatus, Playlist, PlaylistHierarchy,
-            PlaylistId, PlaylistKind, PlaylistLoadState, Track, TrackId,
+            BackendSnapshot, PlaybackContext, PlaybackSnapshot, PlaybackStatus, Playlist,
+            PlaylistHierarchy, PlaylistId, PlaylistKind, PlaylistLoadState, Track, TrackId,
         },
     };
 
@@ -4293,6 +4325,122 @@ mod tests {
                 complete: true,
             })]
         );
+    }
+
+    #[test]
+    fn jump_to_playing_playlist_track_uses_the_session_source_occurrence_without_commands() {
+        let playlist_id = PlaylistId::new("musicapp:playlist:persistent:ACTIVE");
+        let duplicate = Track::new(
+            "musicapp:persistent:DUPLICATE",
+            "Duplicate",
+            "Artist",
+            "Album",
+            Duration::from_secs(60),
+        );
+        let playlist = Playlist::new(
+            playlist_id.to_string(),
+            "Same Name",
+            None,
+            vec![
+                duplicate.clone(),
+                Track::new(
+                    "middle",
+                    "Middle",
+                    "Artist",
+                    "Album",
+                    Duration::from_secs(60),
+                ),
+                duplicate.clone(),
+                Track::new("last", "Last", "Artist", "Album", Duration::from_secs(60)),
+            ],
+        );
+        let mut state = AppState {
+            navigation: crate::app::state::NavigationState {
+                active: Route::PlaylistDetail {
+                    playlist_id: playlist_id.clone(),
+                },
+                history: Vec::new(),
+            },
+            focus: Focus::Content,
+            content_selection: 0,
+            playlists: vec![playlist],
+            playback: PlaybackSnapshot {
+                current_track: Some(duplicate),
+                shuffle: true,
+                context: PlaybackContext::Playlist {
+                    playlist_id,
+                    // Playback order is deliberately not canonical under shuffle.
+                    ordered_track_ids: vec![
+                        TrackId::new("middle"),
+                        TrackId::new("musicapp:persistent:DUPLICATE"),
+                        TrackId::new("last"),
+                        TrackId::new("musicapp:persistent:DUPLICATE"),
+                    ],
+                    current_index: 1,
+                    current_source_index: 2,
+                    complete: true,
+                },
+                ..PlaybackSnapshot::default()
+            },
+            ..AppState::default()
+        };
+
+        assert!(reduce(&mut state, Action::JumpToPlayingTrack).is_empty());
+        assert_eq!(
+            state.content_selection, 2,
+            "must not select the first duplicate"
+        );
+        assert!(matches!(
+            state.playback.context,
+            PlaybackContext::Playlist {
+                current_index: 1,
+                current_source_index: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn jump_to_playing_playlist_track_is_a_silent_no_op_for_other_or_unloaded_playlists() {
+        let active_id = PlaylistId::new("active");
+        let other_id = PlaylistId::new("other");
+        let mut state = AppState {
+            navigation: crate::app::state::NavigationState {
+                active: Route::PlaylistDetail {
+                    playlist_id: active_id.clone(),
+                },
+                history: Vec::new(),
+            },
+            content_selection: 1,
+            playlists: vec![playlist(&active_id.to_string(), "Duplicate Name")],
+            playback: PlaybackSnapshot {
+                context: PlaybackContext::Playlist {
+                    playlist_id: other_id,
+                    ordered_track_ids: vec![TrackId::new("other-track")],
+                    current_index: 0,
+                    current_source_index: 0,
+                    complete: true,
+                },
+                ..PlaybackSnapshot::default()
+            },
+            ..AppState::default()
+        };
+        assert!(reduce(&mut state, Action::JumpToPlayingTrack).is_empty());
+        assert_eq!(state.content_selection, 1);
+
+        state.playback.context = PlaybackContext::NoContext;
+        assert!(reduce(&mut state, Action::JumpToPlayingTrack).is_empty());
+        assert_eq!(state.content_selection, 1);
+
+        state.playback.context = PlaybackContext::Playlist {
+            playlist_id: active_id,
+            ordered_track_ids: vec![TrackId::new("not-loaded")],
+            current_index: 0,
+            current_source_index: 5,
+            complete: false,
+        };
+        assert!(reduce(&mut state, Action::JumpToPlayingTrack).is_empty());
+        assert_eq!(state.content_selection, 1);
     }
 
     #[test]

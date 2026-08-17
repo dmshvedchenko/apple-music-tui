@@ -2,7 +2,10 @@ pub mod capabilities;
 pub mod macos;
 pub mod mock;
 
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -60,6 +63,138 @@ pub enum BackendCommand {
         from: usize,
         to: usize,
     },
+}
+
+/// Scheduling class for work submitted to the single Music.app automation worker.
+///
+/// The worker remains deliberately serialized: Music.app Apple Events are not safe to
+/// mutate concurrently.  This classification only decides what runs *after* the
+/// currently executing Apple Event returns.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CommandPriority {
+    Low,
+    Normal,
+    High,
+    Interactive,
+}
+
+impl CommandPriority {
+    const fn is_interactive(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
+const fn command_priority(command: &BackendCommand) -> CommandPriority {
+    match command {
+        BackendCommand::Play
+        | BackendCommand::Pause
+        | BackendCommand::Stop
+        | BackendCommand::PlayPause
+        | BackendCommand::PlayTrack(_)
+        | BackendCommand::PlayPlaylistTrack { .. }
+        | BackendCommand::PlayPlaylist(_)
+        | BackendCommand::PlayAlbum { .. }
+        | BackendCommand::Next
+        | BackendCommand::Previous
+        | BackendCommand::SeekBy(_)
+        | BackendCommand::SetVolume(_)
+        | BackendCommand::ToggleMute
+        | BackendCommand::ToggleShuffle
+        | BackendCommand::CycleRepeat => CommandPriority::Interactive,
+        BackendCommand::LoadPlaylist(_) | BackendCommand::RemovePlaylistTrack { .. } => {
+            CommandPriority::High
+        }
+        BackendCommand::LoadTrackArtwork { .. } => CommandPriority::Normal,
+        BackendCommand::RefreshLibrary
+        | BackendCommand::OpenPlayer
+        | BackendCommand::ToggleFavoriteCurrent
+        | BackendCommand::Enqueue(_)
+        | BackendCommand::RemoveQueueItem(_)
+        | BackendCommand::MoveQueueItem { .. } => CommandPriority::Low,
+    }
+}
+
+/// Returns whether the command is a latency-sensitive direct user operation.
+#[must_use]
+pub const fn is_interactive_command(command: &BackendCommand) -> bool {
+    command_priority(command).is_interactive()
+}
+
+#[derive(Debug)]
+struct QueuedCommand {
+    command: BackendCommand,
+    queued_at: Instant,
+}
+
+/// Small fair priority scheduler for serialized backend work.
+///
+/// Eight foreground operations may pass a low-priority operation before it is
+/// serviced.  This prevents refresh work from starving during sustained input,
+/// while never letting it delay the first waiting interactive command.
+#[derive(Default)]
+struct CommandScheduler {
+    interactive: VecDeque<QueuedCommand>,
+    high: VecDeque<QueuedCommand>,
+    normal: VecDeque<QueuedCommand>,
+    low: VecDeque<QueuedCommand>,
+    foreground_since_low: usize,
+}
+
+impl CommandScheduler {
+    fn enqueue(&mut self, command: BackendCommand) {
+        if self.contains_equivalent_coalescible(&command) {
+            tracing::debug!(?command, "coalesced redundant backend command");
+            return;
+        }
+        let queued = QueuedCommand {
+            command,
+            queued_at: Instant::now(),
+        };
+        match command_priority(&queued.command) {
+            CommandPriority::Interactive => self.interactive.push_back(queued),
+            CommandPriority::High => self.high.push_back(queued),
+            CommandPriority::Normal => self.normal.push_back(queued),
+            CommandPriority::Low => self.low.push_back(queued),
+        }
+    }
+
+    fn contains_equivalent_coalescible(&self, command: &BackendCommand) -> bool {
+        self.interactive
+            .iter()
+            .chain(&self.high)
+            .chain(&self.normal)
+            .chain(&self.low)
+            .any(|queued| match (&queued.command, command) {
+                (BackendCommand::RefreshLibrary, BackendCommand::RefreshLibrary) => true,
+                (BackendCommand::LoadPlaylist(left), BackendCommand::LoadPlaylist(right)) => {
+                    left == right
+                }
+                (
+                    BackendCommand::LoadTrackArtwork { key: left, .. },
+                    BackendCommand::LoadTrackArtwork { key: right, .. },
+                ) => left == right,
+                _ => false,
+            })
+    }
+
+    fn pop_next(&mut self) -> Option<QueuedCommand> {
+        if !self.low.is_empty() && self.foreground_since_low >= 8 {
+            self.foreground_since_low = 0;
+            return self.low.pop_front();
+        }
+
+        let next = self
+            .interactive
+            .pop_front()
+            .or_else(|| self.high.pop_front())
+            .or_else(|| self.normal.pop_front());
+        if next.is_some() {
+            self.foreground_since_low += 1;
+            return next;
+        }
+        self.foreground_since_low = 0;
+        self.low.pop_front()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,22 +370,50 @@ pub fn spawn_worker<B: MusicBackend>(
             interval_ms = tick_rate.as_millis(),
             "backend polling started"
         );
+        let mut scheduler = CommandScheduler::default();
 
         loop {
+            // Drain commands received while the prior request was running before selecting
+            // another request. This is what lets direct input pass already-queued background
+            // work without attempting to interrupt an active Apple Event.
+            while let Ok(command) = commands.try_recv() {
+                scheduler.enqueue(command);
+            }
+
+            if let Some(queued) = scheduler.pop_next() {
+                let priority = command_priority(&queued.command);
+                let queue_wait = queued.queued_at.elapsed();
+                let command_started = Instant::now();
+                tracing::debug!(
+                    ?priority,
+                    command = ?queued.command,
+                    queue_wait_ms = queue_wait.as_secs_f64() * 1_000.0,
+                    "backend command dequeued"
+                );
+                let event = match backend.execute(queued.command).await {
+                    Ok(update) => BackendEvent::Update(update),
+                    Err(error) => BackendEvent::Error(error.to_string()),
+                };
+                tracing::debug!(
+                    ?priority,
+                    queue_wait_ms = queue_wait.as_secs_f64() * 1_000.0,
+                    command_ms = command_started.elapsed().as_secs_f64() * 1_000.0,
+                    total_ms = (queue_wait + command_started.elapsed()).as_secs_f64() * 1_000.0,
+                    "backend command timing"
+                );
+                if events.send(event).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
             tokio::select! {
                 biased;
                 command = commands.recv() => {
                     let Some(command) = command else {
                         break;
                     };
-                    let event = match backend.execute(command).await {
-                        Ok(update) => BackendEvent::Update(update),
-                        Err(error) => BackendEvent::Error(error.to_string()),
-                    };
-                    if events.send(event).await.is_err() {
-                        break;
-                    }
-                    tracing::trace!(backend = backend.name(), "backend command event emitted");
+                    scheduler.enqueue(command);
                 }
                 _ = ticker.tick() => {
                     tracing::trace!(backend = backend.name(), "backend poll tick");
@@ -276,11 +439,51 @@ pub fn spawn_worker<B: MusicBackend>(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
     use super::*;
     use crate::domain::{PlaybackSnapshot, PlaybackStatus};
 
     struct UpdatingBackend {
         emitted_update: bool,
+    }
+
+    #[derive(Clone)]
+    struct RecordingBackend {
+        executed: Arc<Mutex<Vec<BackendCommand>>>,
+    }
+
+    #[async_trait]
+    impl MusicBackend for RecordingBackend {
+        fn name(&self) -> &'static str {
+            "scheduler-test"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        async fn snapshot(&mut self) -> Result<BackendSnapshot, BackendError> {
+            Ok(BackendSnapshot::default())
+        }
+
+        async fn execute(
+            &mut self,
+            command: BackendCommand,
+        ) -> Result<BackendUpdate, BackendError> {
+            self.executed.lock().expect("execution log").push(command);
+            Ok(BackendUpdate::Snapshot(BackendSnapshot::default()))
+        }
+
+        async fn tick(
+            &mut self,
+            _elapsed: Duration,
+        ) -> Result<Option<BackendUpdate>, BackendError> {
+            Ok(None)
+        }
     }
 
     #[async_trait]
@@ -363,5 +566,118 @@ mod tests {
 
         drop(command_sender);
         worker.await.expect("worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn interactive_playback_jumps_ahead_of_queued_background_work() {
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let (command_sender, command_receiver) = mpsc::channel(8);
+        command_sender
+            .try_send(BackendCommand::RefreshLibrary)
+            .expect("queue refresh");
+        command_sender
+            .try_send(BackendCommand::LoadPlaylist(
+                crate::domain::PlaylistId::new("P1"),
+            ))
+            .expect("queue playlist load");
+        command_sender
+            .try_send(BackendCommand::PlayPause)
+            .expect("queue interactive command");
+        drop(command_sender);
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let worker = spawn_worker(
+            RecordingBackend {
+                executed: Arc::clone(&executed),
+            },
+            command_receiver,
+            event_sender,
+        );
+
+        let _ = event_receiver.recv().await.expect("ready event");
+        for _ in 0..3 {
+            let _ = event_receiver.recv().await.expect("command event");
+        }
+        worker.await.expect("worker shutdown");
+
+        assert_eq!(
+            *executed.lock().expect("execution log"),
+            vec![
+                BackendCommand::PlayPause,
+                BackendCommand::LoadPlaylist(crate::domain::PlaylistId::new("P1")),
+                BackendCommand::RefreshLibrary,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_playlist_loads_and_artwork_requests_are_coalesced() {
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let (command_sender, command_receiver) = mpsc::channel(8);
+        let playlist = crate::domain::PlaylistId::new("P1");
+        command_sender
+            .try_send(BackendCommand::LoadPlaylist(playlist.clone()))
+            .expect("first playlist load");
+        command_sender
+            .try_send(BackendCommand::LoadPlaylist(playlist))
+            .expect("duplicate playlist load");
+        drop(command_sender);
+        let (event_sender, mut event_receiver) = mpsc::channel(8);
+        let worker = spawn_worker(
+            RecordingBackend {
+                executed: Arc::clone(&executed),
+            },
+            command_receiver,
+            event_sender,
+        );
+
+        let _ = event_receiver.recv().await.expect("ready event");
+        let _ = event_receiver.recv().await.expect("playlist event");
+        worker.await.expect("worker shutdown");
+
+        assert!(matches!(
+            executed.lock().expect("execution log").as_slice(),
+            [BackendCommand::LoadPlaylist(id)] if id == &crate::domain::PlaylistId::new("P1")
+        ));
+    }
+
+    #[test]
+    fn ordered_interactive_commands_stay_ordered_and_background_work_runs() {
+        let mut scheduler = CommandScheduler::default();
+        scheduler.enqueue(BackendCommand::RefreshLibrary);
+        scheduler.enqueue(BackendCommand::Next);
+        scheduler.enqueue(BackendCommand::Previous);
+
+        assert!(matches!(
+            scheduler.pop_next().map(|queued| queued.command),
+            Some(BackendCommand::Next)
+        ));
+        assert!(matches!(
+            scheduler.pop_next().map(|queued| queued.command),
+            Some(BackendCommand::Previous)
+        ));
+        assert!(matches!(
+            scheduler.pop_next().map(|queued| queued.command),
+            Some(BackendCommand::RefreshLibrary)
+        ));
+    }
+
+    #[test]
+    fn low_priority_work_is_fair_after_eight_foreground_commands() {
+        let mut scheduler = CommandScheduler::default();
+        scheduler.enqueue(BackendCommand::RefreshLibrary);
+        for _ in 0..9 {
+            scheduler.enqueue(BackendCommand::PlayPause);
+        }
+
+        for _ in 0..8 {
+            assert!(matches!(
+                scheduler.pop_next().map(|queued| queued.command),
+                Some(BackendCommand::PlayPause)
+            ));
+        }
+        assert!(matches!(
+            scheduler.pop_next().map(|queued| queued.command),
+            Some(BackendCommand::RefreshLibrary)
+        ));
     }
 }

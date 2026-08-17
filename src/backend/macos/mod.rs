@@ -36,6 +36,10 @@ use self::{
 };
 
 const COLLECTION_BATCH_SIZE: usize = 400;
+/// A small first response makes Playlist Detail useful before Music.app has read every row.
+/// Subsequent batches remain larger to preserve total-load throughput.
+const PLAYLIST_INITIAL_BATCH_SIZE: usize = 40;
+const PLAYLIST_CONTINUATION_BATCH_SIZE: usize = 200;
 const MAX_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
 const INTERNAL_TRANSITION_GRACE: Duration = Duration::from_secs(3);
 const PREVIOUS_RESTART_THRESHOLD: Duration = Duration::from_secs(3);
@@ -110,6 +114,7 @@ impl PlaybackSession {
                 playlist_id: playlist_id.clone(),
                 ordered_track_ids,
                 current_index: self.index,
+                current_source_index: self.tracks[self.index].source_index,
                 complete: *complete,
             },
             PlaybackSessionSource::Album { album_id } => PlaybackContext::Album {
@@ -253,25 +258,34 @@ impl MacOsMusicBackend {
         self.has_cached_library = true;
     }
 
-    async fn persist_library_cache(&self) {
+    fn schedule_library_cache_persist(&self) {
         let Some(path) = self.cache_path.clone() else {
             return;
         };
         let library = self.snapshot.library.clone();
         let track_count = library.len();
         let playlists = self.snapshot.playlists.clone();
-        match tokio::task::spawn_blocking(move || cache::store(&path, &library, &playlists)).await {
-            Ok(Ok(())) => tracing::debug!(
-                tracks = track_count,
-                "updated local Music.app library cache"
-            ),
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "could not update local Music.app library cache")
+        // Cache serialization and atomic disk I/O are deliberately detached from the single
+        // automation worker. Waiting for this write here used to delay the next Space/Enter
+        // command after a full refresh had completed.
+        tokio::spawn(async move {
+            let started = Instant::now();
+            match tokio::task::spawn_blocking(move || cache::store(&path, &library, &playlists))
+                .await
+            {
+                Ok(Ok(())) => tracing::debug!(
+                    tracks = track_count,
+                    cache_write_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    "updated local Music.app library cache"
+                ),
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "could not update local Music.app library cache")
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "local Music.app cache writer stopped unexpectedly")
+                }
             }
-            Err(error) => {
-                tracing::debug!(%error, "local Music.app cache writer stopped unexpectedly")
-            }
-        }
+        });
     }
 
     async fn query(&self, request: ScriptRequest) -> Result<RawMusicState, BackendFailure> {
@@ -1129,7 +1143,7 @@ impl MacOsMusicBackend {
             self.snapshot.recently_played = derived.recently_played.clone();
             self.snapshot.library_status = CollectionLoadState::Loaded { total: batch.total };
             self.phase = LoadPhase::Ready;
-            self.persist_library_cache().await;
+            self.schedule_library_cache_persist();
         } else {
             self.snapshot.library_status = if self.has_cached_library {
                 CollectionLoadState::Refreshing {
@@ -1163,6 +1177,12 @@ impl MacOsMusicBackend {
     }
 
     async fn load_playlist_batch(&mut self, load: PendingPlaylistLoad) -> BackendUpdate {
+        let batch_started = Instant::now();
+        let batch_limit = if load.next == 0 {
+            PLAYLIST_INITIAL_BATCH_SIZE
+        } else {
+            PLAYLIST_CONTINUATION_BATCH_SIZE
+        };
         let Some(persistent_id) = persistent_playlist_selector(&load.id).map(str::to_owned) else {
             self.pending_playlist = None;
             return self.playback_update();
@@ -1171,7 +1191,7 @@ impl MacOsMusicBackend {
             .query(ScriptRequest::PlaylistBatch {
                 playlist_persistent_id: persistent_id,
                 start: load.next,
-                limit: COLLECTION_BATCH_SIZE,
+                limit: batch_limit,
                 total: load.total,
             })
             .await
@@ -1290,6 +1310,17 @@ impl MacOsMusicBackend {
                 total: Some(batch.total),
             })
         };
+        tracing::debug!(
+            playlist_id = %load.id,
+            start = batch.start,
+            limit = batch_limit,
+            tracks = tracks.len(),
+            loaded,
+            total = batch.total,
+            complete,
+            batch_total_ms = batch_started.elapsed().as_secs_f64() * 1_000.0,
+            "Music.app playlist batch timing"
+        );
         BackendUpdate::PlaylistBatch {
             availability: self.snapshot.availability.clone(),
             playback: self.snapshot.playback.clone(),
@@ -3061,7 +3092,7 @@ mod tests {
                 ScriptRequest::PlaylistBatch {
                     playlist_persistent_id: "P".to_owned(),
                     start: 0,
-                    limit: COLLECTION_BATCH_SIZE,
+                    limit: PLAYLIST_INITIAL_BATCH_SIZE,
                     total: None,
                 },
                 r#"{"running":true,"state":"paused","position":0,"volume":50,"playlistBatch":{"playlistPersistentId":"P","start":0,"total":2,"tracks":[{"persistentId":"T1","name":"One","artist":"Artist","album":"Playlist","duration":60}]}}"#,
@@ -3070,7 +3101,7 @@ mod tests {
                 ScriptRequest::PlaylistBatch {
                     playlist_persistent_id: "P".to_owned(),
                     start: 1,
-                    limit: COLLECTION_BATCH_SIZE,
+                    limit: PLAYLIST_CONTINUATION_BATCH_SIZE,
                     total: Some(2),
                 },
                 r#"{"running":true,"state":"paused","position":0,"volume":50,"playlistBatch":{"playlistPersistentId":"P","start":1,"total":2,"tracks":[{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}]}}"#,
@@ -3148,6 +3179,7 @@ mod tests {
             ordered_track_ids,
             current_index,
             complete,
+            ..
         } = backend.snapshot.playback.context.clone()
         else {
             panic!("playlist context")
@@ -3621,7 +3653,7 @@ mod tests {
                 .await
                 .expect("playlist track batch");
             if let BackendUpdate::PlaylistBatch { tracks, total, .. } = update {
-                assert!(tracks.len() <= COLLECTION_BATCH_SIZE);
+                assert!(tracks.len() <= PLAYLIST_INITIAL_BATCH_SIZE);
                 if (1..=20).contains(&total) {
                     assert!(!tracks.is_empty());
                     assert!(

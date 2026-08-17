@@ -2109,6 +2109,7 @@ fn player_status_line(state: &AppState, layout: PlayerLayout, width: u16) -> Str
                 ordered_track_ids,
                 current_index,
                 complete,
+                ..
             } => {
                 let name = state
                     .playlists
@@ -2639,6 +2640,7 @@ fn context_help_lines(state: &AppState, theme: Theme) -> Vec<Line<'static>> {
             let mut entries = vec![
                 ("Enter", "play selected track"),
                 ("P", "play playlist"),
+                (".", "jump to playing track"),
                 ("a", "actions"),
             ];
             if removable {
@@ -2789,11 +2791,11 @@ mod tests {
 
     use super::artwork::TerminalArtworkProtocol;
     use super::{
-        BindingGroup, TrackListMode, artwork_panel_text, centered_popup, context_action_label,
-        context_help_lines, full_now_playing_layout, help_column_count, help_lines,
-        now_playing_artwork_text, playback_control_icon, player_layout, player_status_line,
-        player_title_line, track_column_plan, truncate_cell, visible_help_lines,
-        visible_item_range,
+        BindingGroup, DEFAULT, TrackListMode, artwork_panel_text, centered_popup,
+        context_action_label, context_help_lines, full_now_playing_layout, help_column_count,
+        help_lines, now_playing_artwork_text, playback_control_icon, player_layout,
+        player_status_line, player_title_line, track_column_plan, truncate_cell,
+        visible_help_lines, visible_item_range,
     };
 
     #[test]
@@ -2865,6 +2867,7 @@ mod tests {
                     playlist_id: PlaylistId::new("playlist"),
                     ordered_track_ids,
                     current_index: 5,
+                    current_source_index: 5,
                     complete: true,
                 },
                 ..PlaybackSnapshot::default()
@@ -3052,6 +3055,7 @@ mod tests {
                     playlist_id: playlist.id.clone(),
                     ordered_track_ids: vec![TrackId::new("one"), TrackId::new("two")],
                     current_index: 1,
+                    current_source_index: 1,
                     complete: true,
                 },
                 ..PlaybackSnapshot::default()
@@ -3165,6 +3169,39 @@ mod tests {
         assert_eq!(visible_item_range(12_997, 100, 16, 2), 96..104);
         assert_eq!(visible_item_range(12_997, 12_996, 16, 2), 12_989..12_997);
         assert_eq!(visible_item_range(12_997, 100, 16, 1), 92..108);
+    }
+
+    #[test]
+    fn playlist_help_advertises_jump_to_playing_track_only_in_playlist_detail() {
+        let playlist = Playlist::new("playlist", "Playlist", None, Vec::new());
+        let detail = AppState {
+            navigation: NavigationState {
+                active: Route::PlaylistDetail {
+                    playlist_id: playlist.id.clone(),
+                },
+                history: Vec::new(),
+            },
+            playlists: vec![playlist],
+            ..AppState::default()
+        };
+        let detail_help = context_help_lines(&detail, DEFAULT)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(detail_help.contains("jump to playing track"));
+
+        let songs = AppState {
+            navigation: NavigationState {
+                active: Route::Section(Screen::Songs),
+                history: Vec::new(),
+            },
+            ..AppState::default()
+        };
+        let songs_help = context_help_lines(&songs, DEFAULT)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(!songs_help.contains("jump to playing track"));
     }
 
     #[test]
@@ -3461,6 +3498,7 @@ mod tests {
                         .map(|track| track.id.clone())
                         .collect(),
                     current_index: 1,
+                    current_source_index: 1,
                     complete: true,
                 },
                 ..PlaybackSnapshot::default()
