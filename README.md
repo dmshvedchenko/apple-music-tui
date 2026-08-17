@@ -1,13 +1,23 @@
 # apple-music-tui
 
-`apple-music-tui` is a keyboard-first terminal interface for Apple Music
-on macOS.
+![GitHub release](https://img.shields.io/github/v/release/dmshvedchenko/apple-music-tui)
+![License](https://img.shields.io/github/license/dmshvedchenko/apple-music-tui)
+![Rust](https://img.shields.io/badge/Rust-1.88+-orange)
+![Platform](https://img.shields.io/badge/macOS-15+-blue)
 
-Built with Rust and Ratatui, it provides a local-first Apple Music
-client using Music.app automation without requiring an Apple Developer
-Program membership.
+`apple-music-tui` is a keyboard-first terminal interface for Apple Music on macOS.
+
+Built with Rust and Ratatui, it provides a local-first Apple Music client using Music.app automation without requiring an Apple Developer Program membership.
 
 ![apple-music-tui](docs/screenshots/player.png)
+
+## Why?
+
+Apple Music has an excellent catalog, but very few keyboard-first desktop clients.
+
+`apple-music-tui` focuses on fast navigation, efficient keyboard workflows, and native Music.app integration while leaving playback, DRM, and audio output to Apple's own application.
+
+If you enjoy tools like **lazygit**, **k9s**, **btop**, or **yazi**, the interface should feel immediately familiar.
 
 ## Features
 
@@ -18,11 +28,13 @@ Program membership.
 - 🔀 Session-based shuffle
 - 🔎 Search, sorting and filtering
 - 📂 Playlist and album playback
+- ⚡ Fast metadata cache with background refresh
 - ⌨ Keyboard-driven workflow
 - 🍺 Homebrew installation
 
-Music.app remains the audio engine. The application does not decode or
-stream Apple Music audio itself.
+Music.app remains the audio engine. `apple-music-tui` never decodes or streams Apple Music audio itself.
+
+---
 
 ## Installation
 
@@ -38,25 +50,28 @@ Run:
 apple-music-tui --backend macos
 ```
 
-### From source
+### Build from source
 
 Requirements:
 
 - macOS
-- Rust stable 1.88+
-- Music.app installed
+- Music.app
+- Rust 1.88+
 - Terminal with alternate screen support
 
 ```bash
 cargo install --path .
+
 apple-music-tui --version
 apple-music-tui doctor
 apple-music-tui --backend macos
 ```
 
+---
+
 ## Screenshots
 
-### Playlist browsing and playback
+### Playlist browsing
 
 ![Playlist view](docs/screenshots/player.png)
 
@@ -64,41 +79,49 @@ apple-music-tui --backend macos
 
 ![Now Playing](docs/screenshots/now-playing.png)
 
+---
+
 ## Links
 
-- Source code: https://github.com/dmshvedchenko/apple-music-tui
+- **GitHub**  
+  https://github.com/dmshvedchenko/apple-music-tui
 
-- Releases: https://github.com/dmshvedchenko/apple-music-tui/releases
+- **Releases**  
+  https://github.com/dmshvedchenko/apple-music-tui/releases
 
-- Homebrew tap: https://github.com/dmshvedchenko/homebrew-tap
+- **Homebrew Tap**  
+  https://github.com/dmshvedchenko/homebrew-tap
+
+---
 
 ## Local Music.app backend
 
-The macOS backend provides a local-first Apple Music experience without
-paid Apple Developer Program membership.
+The macOS backend provides a complete local-first Apple Music experience without a paid Apple Developer Program membership.
 
 Supported:
 
-- real Music.app playlists and folders;
-- lazy-loaded playlist contents;
-- local library Songs;
-- derived Albums and Artists;
-- local Recently Added and Recently Played;
-- cached search;
-- artwork loading;
-- exact track playback;
-- playlist and album playback sessions;
-- playback state synchronization.
+- hierarchical playlists and folders
+- progressive playlist loading
+- local library
+- Artists / Albums / Recently Added / Recently Played
+- search
+- artwork
+- exact track playback
+- playlist and album playback
+- playback synchronization with Music.app
 
 Music.app remains authoritative for:
 
-- current track;
-- playback state;
-- audio output.
+- playback
+- DRM
+- current track
+- audio output
+
+---
 
 ## Cache and refresh
 
-After the first successful scan, metadata cache allows faster startup.
+After the first successful scan the application stores a local metadata cache.
 
 Startup:
 
@@ -106,7 +129,7 @@ Startup:
 Library: Cached
 ```
 
-Music.app refreshes data in the background:
+Background refresh:
 
 ```text
 Refreshing loaded/total
@@ -126,18 +149,26 @@ apple-music-tui cache-status
 apple-music-tui cache-clear
 ```
 
-The cache does not contain playback state, session state, or artwork
-bytes.
+The cache contains metadata only.
+
+It never stores:
+
+- playback state
+- playback sessions
+- artwork
+
+---
 
 ## Artwork
 
 Artwork is loaded lazily and cached.
 
-Supported:
+Supported terminals:
 
-- Kitty graphics protocol;
-- iTerm2 inline images;
-- Unicode fallback.
+- Kitty graphics protocol
+- Ghostty
+- iTerm2
+- Unicode fallback
 
 For tmux:
 
@@ -145,86 +176,79 @@ For tmux:
 set -g allow-passthrough on
 ```
 
-Unsupported terminals automatically fall back without affecting playback
-or navigation.
+---
 
 ## Playback sessions
 
 Playlist and album playback use synthesized stable-ID sessions.
 
-This provides:
+This enables:
 
-- exact track continuation;
-- previous/next handling;
-- session shuffle;
-- repeat support;
-- Music.app synchronization.
+- exact continuation
+- previous / next
+- repeat
+- shuffle
+- playback synchronization
 
-The application does not implement:
+### Intentionally not supported
 
-- Up Next;
-- Play Next;
-- Play Later;
-- queue editing.
+These features are unavailable because Music.app does not expose public APIs for them:
 
-These features require APIs that Music.app does not currently expose.
+- Up Next editing
+- Play Next
+- Play Later
+- queue editing
+- timed lyrics
+- recommendations
+
+---
 
 ## Playlist editing
 
-The only supported playlist mutation is removing a track occurrence from
-an editable normal user playlist.
+The only supported playlist mutation is removing a track occurrence from an editable user playlist.
 
-Press:
+Key:
 
 ```text
 d
 ```
 
-After confirmation:
+After confirmation it removes only the selected playlist entry.
 
-- removes one selected playlist entry;
-- never deletes the library track;
-- safely handles duplicate tracks.
-
-Unsupported:
-
-- smart playlists;
-- system playlists;
-- playlist creation;
-- playlist reorder;
-- ratings;
-- favorites writes.
-
-## Keyboard shortcuts
-
-Key Action
+The underlying library track is never deleted.
 
 ---
 
-`j/k` Navigate
-`gg/G` First/last item
-`Enter` Open or play
-`P` Play playlist/album
-`.` Jump to currently playing playlist track
-`N` Full-screen Now Playing
-`n/p` Next/previous track
-`Space` Play/pause
-`s` Toggle shuffle
-`r` Toggle repeat
-`R` Refresh library
-`/` Search
-`S` Sort
-`F` Filter
-`?` Help
-`q` Quit
+## Keyboard shortcuts
+
+| Key     | Action                        |
+| ------- | ----------------------------- |
+| `j/k`   | Navigate                      |
+| `gg/G`  | First / last item             |
+| `Enter` | Open / play                   |
+| `P`     | Play playlist or album        |
+| `.`     | Jump to current playing track |
+| `N`     | Full-screen Now Playing       |
+| `Space` | Play / Pause                  |
+| `n/p`   | Next / Previous               |
+| `s`     | Toggle shuffle                |
+| `r`     | Toggle repeat                 |
+| `R`     | Refresh library               |
+| `/`     | Search                        |
+| `S`     | Sort                          |
+| `F`     | Filter                        |
+| `?`     | Help                          |
+| `q`     | Quit                          |
+
+---
 
 ## Optional Apple Music API
 
-Apple Developer credentials are not required for local Music.app
-playback.
+Local playback does **not** require Apple Developer credentials.
 
-The optional Apple Music API path exists for future catalog and
-personalized features.
+The optional Apple Music API path is reserved for future cloud features.
+
+---
 
 ## Development
 
@@ -235,25 +259,17 @@ cargo test
 cargo build --release
 ```
 
-## Repository
-
-Source:
-
-https://github.com/dmshvedchenko/apple-music-tui
-
-License:
-
-MIT
+---
 
 ## Troubleshooting
 
 ### Music.app permission
 
-Enable Automation permission for the application that launches `apple-music-tui`:
+Enable Automation permission for the application launching `apple-music-tui`.
 
 System Settings → Privacy & Security → Automation
 
-Possible hosts:
+Typical hosts:
 
 - Terminal
 - iTerm2
@@ -261,17 +277,15 @@ Possible hosts:
 
 ### Music.app is not running
 
-The TUI does not automatically launch Music.app.
-
-Use:
+Press:
 
 ```text
 o
 ```
 
-to open it.
+to launch Music.app.
 
-### Artwork in tmux
+### Artwork inside tmux
 
 Enable:
 
@@ -279,11 +293,21 @@ Enable:
 set -g allow-passthrough on
 ```
 
-or force:
+or force the renderer:
 
 ```bash
 APPLE_MUSIC_TUI_ARTWORK_RENDERER=kitty
 ```
+
+---
+
+## Feedback
+
+Bug reports, feature requests and pull requests are welcome.
+
+If you enjoy the project, consider giving it a ⭐ on GitHub.
+
+---
 
 ## License
 
