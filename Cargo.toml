@@ -1,6 +1,6 @@
 [package]
 name = "apple-music-tui"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.88"
 description = "A keyboard-first terminal interface for Apple Music"
