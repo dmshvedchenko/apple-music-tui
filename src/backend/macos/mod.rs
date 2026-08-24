@@ -4,6 +4,8 @@ mod library;
 mod parser;
 mod script;
 
+pub(crate) use automation::{FilePickerResult, choose_audio_files};
+
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -94,6 +96,9 @@ struct PlaybackSession {
     source: PlaybackSessionSource,
     tracks: Vec<SessionTrack>,
     index: usize,
+    /// Logical repeat mode for the synthesized order. Music.app native repeat stays off
+    /// while this session is active so it cannot race exact `once` transitions.
+    repeat_mode: RepeatMode,
     /// The confirmed Music.app shuffle mode committed to this synthesized session.
     shuffle_enabled: bool,
     /// One ordering seed per enabled shuffle cycle; polls must not reshuffle it.
@@ -167,6 +172,7 @@ pub struct MacOsMusicBackend {
     pending_context_error: Option<String>,
     cache_path: Option<PathBuf>,
     has_cached_library: bool,
+    invalidate_playlist_contents: bool,
 }
 
 /// Read-only metadata for the local Music.app library cache.
@@ -238,6 +244,7 @@ impl MacOsMusicBackend {
             pending_context_error: None,
             cache_path,
             has_cached_library: false,
+            invalidate_playlist_contents: false,
         }
     }
 
@@ -396,10 +403,12 @@ impl MacOsMusicBackend {
     }
 
     fn sync_playback_context(&mut self) {
-        self.snapshot.playback.context = self
-            .playback_session
-            .as_ref()
-            .map_or(PlaybackContext::NoContext, PlaybackSession::context);
+        if let Some(session) = self.playback_session.as_ref() {
+            self.snapshot.playback.context = session.context();
+            self.snapshot.playback.repeat = session.repeat_mode;
+        } else {
+            self.snapshot.playback.context = PlaybackContext::NoContext;
+        }
     }
 
     /// Reconcile only the cursor of an existing synthesized session with Music.app.
@@ -529,7 +538,12 @@ impl MacOsMusicBackend {
     }
 
     async fn poll(&mut self) -> BackendUpdate {
-        match self.query(ScriptRequest::Poll).await {
+        let request = if self.playback_session.is_some() {
+            ScriptRequest::PollSession
+        } else {
+            ScriptRequest::Poll
+        };
+        match self.query(request).await {
             Ok(raw) => {
                 let previous = self.snapshot.playback.clone();
                 self.apply_raw_playback(&raw);
@@ -645,6 +659,7 @@ impl MacOsMusicBackend {
             source: PlaybackSessionSource::Album { album_id },
             tracks,
             index: 0,
+            repeat_mode: self.snapshot.playback.repeat,
             shuffle_enabled,
             shuffle_seed,
             transition: None,
@@ -712,6 +727,7 @@ impl MacOsMusicBackend {
             },
             tracks,
             index: session_index,
+            repeat_mode: self.snapshot.playback.repeat,
             shuffle_enabled: shuffle_seed.is_some(),
             shuffle_seed,
             transition: None,
@@ -845,7 +861,7 @@ impl MacOsMusicBackend {
         let Some(session) = self.playback_session.as_mut() else {
             return SessionAdvance::End;
         };
-        if let Some(index) = session.next_index(self.snapshot.playback.repeat) {
+        if let Some(index) = session.next_index(session.repeat_mode) {
             return SessionAdvance::Play(index);
         }
         if !session.source_is_complete() {
@@ -975,7 +991,7 @@ impl MacOsMusicBackend {
         let PlaybackSessionSource::Playlist { playlist_id, .. } = &session.source else {
             return None;
         };
-        let target_index = session.next_index(self.snapshot.playback.repeat)?;
+        let target_index = session.next_index(session.repeat_mode)?;
         Some((
             playlist_id.clone(),
             session.tracks[session.index].selector.clone(),
@@ -1072,10 +1088,46 @@ impl MacOsMusicBackend {
             next: 0,
             total: None,
         };
+        let invalidate_contents = std::mem::take(&mut self.invalidate_playlist_contents);
         BackendUpdate::Playlists {
             availability: self.snapshot.availability.clone(),
             playback: self.snapshot.playback.clone(),
             playlists,
+            invalidate_contents,
+        }
+    }
+
+    async fn import_files(&mut self, paths: Vec<PathBuf>) -> BackendUpdate {
+        let paths = match validated_import_paths(paths) {
+            Ok(paths) => paths,
+            Err(message) => {
+                return BackendUpdate::ImportFailed {
+                    availability: self.snapshot.availability.clone(),
+                    playback: self.snapshot.playback.clone(),
+                    message,
+                };
+            }
+        };
+        match self.query(ScriptRequest::ImportFiles(paths.clone())).await {
+            Ok(raw) => {
+                self.apply_raw_playback(&raw);
+                self.snapshot.library_status = CollectionLoadState::Refreshing {
+                    loaded: 0,
+                    total: 0,
+                };
+                self.phase = LoadPhase::DiscoverPlaylists;
+                self.invalidate_playlist_contents = true;
+                BackendUpdate::ImportCompleted {
+                    availability: self.snapshot.availability.clone(),
+                    playback: self.snapshot.playback.clone(),
+                    imported: raw.imported_count.unwrap_or(paths.len()),
+                }
+            }
+            Err(failure) => BackendUpdate::ImportFailed {
+                availability: self.snapshot.availability.clone(),
+                playback: self.snapshot.playback.clone(),
+                message: failure_message(&failure),
+            },
         }
     }
 
@@ -1485,11 +1537,13 @@ impl MusicBackend for MacOsMusicBackend {
                     total: 0,
                 };
                 self.phase = LoadPhase::DiscoverPlaylists;
+                self.invalidate_playlist_contents = true;
                 return Ok(BackendUpdate::LibraryRefreshStarted {
                     availability: self.snapshot.availability.clone(),
                     playback: self.snapshot.playback.clone(),
                 });
             }
+            BackendCommand::ImportFiles(paths) => return Ok(self.import_files(paths).await),
             BackendCommand::OpenPlayer => ScriptRequest::OpenPlayer,
             BackendCommand::Play => ScriptRequest::Play,
             BackendCommand::Pause => ScriptRequest::Pause,
@@ -1680,36 +1734,30 @@ impl MusicBackend for MacOsMusicBackend {
                 });
             }
             BackendCommand::Next => {
-                if let Some(session) = &self.playback_session {
-                    let next = session.next_index(self.snapshot.playback.repeat);
-                    if let Some(next) = next {
-                        tracing::debug!(
-                            next = %session.tracks[next].id,
-                            source = "session",
-                            "synthesized manual advance"
-                        );
-                        return Ok(match self.play_session_index(next).await {
+                if self.playback_session.is_some() {
+                    // Natural completion and manual Next deliberately share this transition
+                    // decision, including Repeat Off/All/One and partial playlist behavior.
+                    return Ok(match self.automatic_session_advance() {
+                        SessionAdvance::Play(index) => match self.play_session_index(index).await {
                             Ok(()) => self.playback_update(),
                             Err(failure) => self.session_failure_update(
                                 "Failed to move to the next collection track",
                                 failure,
                             ),
-                        });
-                    }
-                    if !session.source_is_complete() {
-                        if let Some(session) = self.playback_session.as_mut() {
-                            session.waiting_for_more = true;
+                        },
+                        SessionAdvance::WaitForMore => {
+                            self.run_playback_command(ScriptRequest::Pause).await;
+                            BackendUpdate::Notice {
+                                availability: self.snapshot.availability.clone(),
+                                playback: self.snapshot.playback.clone(),
+                                message: "Loading next playlist track…".to_owned(),
+                            }
                         }
-                        self.sync_playback_context();
-                        self.run_playback_command(ScriptRequest::Pause).await;
-                        return Ok(BackendUpdate::Notice {
-                            availability: self.snapshot.availability.clone(),
-                            playback: self.snapshot.playback.clone(),
-                            message: "Loading next playlist track…".to_owned(),
-                        });
-                    }
-                    self.cancel_playback_session("Next reached the final collection track");
-                    return Ok(self.run_playback_command(ScriptRequest::Pause).await);
+                        SessionAdvance::End => {
+                            self.cancel_playback_session("Next reached the final collection track");
+                            self.run_playback_command(ScriptRequest::Pause).await
+                        }
+                    });
                 }
                 ScriptRequest::Next
             }
@@ -1748,7 +1796,14 @@ impl MusicBackend for MacOsMusicBackend {
                 );
                 return Ok(self.playback_update());
             }
-            BackendCommand::CycleRepeat => ScriptRequest::CycleRepeat,
+            BackendCommand::CycleRepeat => {
+                if let Some(session) = self.playback_session.as_mut() {
+                    session.repeat_mode = session.repeat_mode.next();
+                    self.sync_playback_context();
+                    return Ok(self.playback_update());
+                }
+                ScriptRequest::CycleRepeat
+            }
             BackendCommand::ToggleFavoriteCurrent => {
                 return Err(BackendError::Unsupported(Capability::Favorite));
             }
@@ -1826,6 +1881,7 @@ fn classify_automation_error(error: AutomationError) -> BackendFailure {
 fn classify_automation_error(error: AutomationError) -> BackendFailure {
     match error {
         AutomationError::UnsupportedPlatform => BackendFailure::Unavailable,
+        other => BackendFailure::Error(other.to_string()),
     }
 }
 
@@ -1863,6 +1919,33 @@ fn refresh_failure_message(failure: &BackendFailure) -> String {
         BackendFailure::PermissionDenied => "Automation access to Music.app was denied".to_owned(),
         BackendFailure::Error(_) => "Music.app could not refresh the library".to_owned(),
     }
+}
+
+fn validated_import_paths(paths: Vec<PathBuf>) -> Result<Vec<String>, String> {
+    const SUPPORTED_EXTENSIONS: &[&str] = &[
+        "aac", "aif", "aiff", "alac", "flac", "m4a", "m4b", "mp3", "mp4", "wav",
+    ];
+    if paths.is_empty() {
+        return Err("No audio files were selected".to_owned());
+    }
+    let mut validated = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_file() {
+            return Err(format!("{} is not a readable file", path.display()));
+        }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        if !extension
+            .as_deref()
+            .is_some_and(|extension| SUPPORTED_EXTENSIONS.contains(&extension))
+        {
+            return Err(format!("{} is not a supported audio file", path.display()));
+        }
+        validated.push(path.to_string_lossy().into_owned());
+    }
+    Ok(validated)
 }
 
 fn playlist_shuffle_seed(playlist_id: &PlaylistId) -> u64 {
@@ -1954,7 +2037,7 @@ fn artwork_result(raw: Option<RawArtwork>) -> ArtworkResult {
         return ArtworkResult::Invalid("Music.app returned an invalid artwork size".to_owned());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let Some(high) = hex_digit(pair[0]) else {
             return ArtworkResult::Invalid("Artwork descriptor was not hexadecimal".to_owned());
         };
@@ -2136,7 +2219,14 @@ mod tests {
                 .expect("response lock")
                 .pop_front()
                 .expect("script response");
-            assert_eq!(request, expected);
+            assert!(
+                request == expected
+                    || matches!(
+                        (&request, &expected),
+                        (ScriptRequest::PollSession, ScriptRequest::Poll)
+                    ),
+                "actual request {request:?} did not match expected {expected:?}"
+            );
             Ok(response)
         }
     }
@@ -2178,7 +2268,7 @@ mod tests {
                         r#"{{"running":true,"state":"playing","position":0,"volume":50,"shuffle":{shuffle},"track":{{"persistentId":"{current}","name":"{current}","artist":"Artist","album":"Playlist","duration":60}}}}"#
                     ));
                 }
-                ScriptRequest::Poll => {
+                ScriptRequest::Poll | ScriptRequest::PollSession => {
                     let current = self.current_id.lock().expect("current lock").clone();
                     let shuffle = *self.shuffle.lock().expect("shuffle lock");
                     return Ok(format!(
@@ -2204,6 +2294,56 @@ mod tests {
         let mut backend = MacOsMusicBackend::with_runner(runner, false);
         let snapshot = backend.snapshot().await.expect("snapshot");
         assert_eq!(snapshot.availability, BackendAvailability::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn import_starts_an_authoritative_refresh_without_recreating_playback_state() {
+        let path = std::env::temp_dir().join(format!(
+            "apple-music-tui-import-{}.mp3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"fixture").expect("create import fixture");
+        let encoded_path = path.to_string_lossy().into_owned();
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new_owned([
+            (
+                ScriptRequest::ImportFiles(vec![encoded_path]),
+                r#"{"running":true,"state":"paused","position":0,"volume":50,"importedCount":1}"#
+                    .to_owned(),
+            ),
+            (
+                ScriptRequest::DiscoverPlaylists,
+                r#"{"running":true,"state":"paused","position":0,"volume":50,"playlists":[]}"#
+                    .to_owned(),
+            ),
+        ]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+        let update = backend
+            .execute(BackendCommand::ImportFiles(vec![path.clone()]))
+            .await
+            .expect("import command");
+        let _ = std::fs::remove_file(path);
+        assert!(matches!(
+            update,
+            BackendUpdate::ImportCompleted { imported: 1, .. }
+        ));
+        assert!(matches!(backend.phase, LoadPhase::DiscoverPlaylists));
+        assert!(backend.invalidate_playlist_contents);
+
+        let update = backend
+            .tick(Duration::ZERO)
+            .await
+            .expect("refresh tick")
+            .expect("playlist update");
+        assert!(matches!(
+            update,
+            BackendUpdate::Playlists {
+                invalidate_contents: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2483,15 +2623,11 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_session_honors_repeat_all_and_repeat_one_at_the_end() {
-        for (repeat, expected) in [("all", "T1"), ("one", "T2")] {
-            let start = format!(
-                r#"{{"running":true,"state":"playing","position":0,"volume":50,"repeat":"{repeat}","track":{{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}}}"#
-            );
-            let stopped = format!(
-                r#"{{"running":true,"state":"stopped","position":60,"volume":50,"repeat":"{repeat}","track":{{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}}}"#
-            );
+        for (logical_repeat, expected) in [(RepeatMode::All, "T1"), (RepeatMode::One, "T2")] {
+            let start = r#"{"running":true,"state":"playing","position":0,"volume":50,"repeat":"off","track":{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}"#.to_owned();
+            let stopped = r#"{"running":true,"state":"stopped","position":60,"volume":50,"repeat":"off","track":{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}"#.to_owned();
             let continued = format!(
-                r#"{{"running":true,"state":"playing","position":0,"volume":50,"repeat":"{repeat}","track":{{"persistentId":"{expected}","name":"Continued","artist":"Artist","album":"Playlist","duration":60}}}}"#
+                r#"{{"running":true,"state":"playing","position":0,"volume":50,"repeat":"off","track":{{"persistentId":"{expected}","name":"Continued","artist":"Artist","album":"Playlist","duration":60}}}}"#
             );
             let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new_owned([
                 (
@@ -2511,6 +2647,7 @@ mod tests {
                 ),
             ]));
             let mut backend = MacOsMusicBackend::with_runner(runner, true);
+            backend.snapshot.playback.repeat = logical_repeat;
             backend
                 .execute(BackendCommand::PlayPlaylistTrack {
                     playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
@@ -2535,6 +2672,156 @@ mod tests {
                 TrackId::new(format!("musicapp:persistent:{expected}"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn manual_next_uses_the_same_repeat_all_session_transition() {
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([
+            (
+                ScriptRequest::PlayPlaylistTrackOnce {
+                    playlist_persistent_id: "P".to_owned(),
+                    track: TrackSelector::PersistentId("T2".to_owned()),
+                },
+                r#"{"running":true,"state":"playing","position":0,"volume":50,"repeat":"off","track":{"persistentId":"T2","name":"Two","artist":"Artist","album":"Playlist","duration":60}}"#,
+            ),
+            (
+                ScriptRequest::PlayPlaylistTrackOnce {
+                    playlist_persistent_id: "P".to_owned(),
+                    track: TrackSelector::PersistentId("T1".to_owned()),
+                },
+                r#"{"running":true,"state":"playing","position":0,"volume":50,"repeat":"off","track":{"persistentId":"T1","name":"One","artist":"Artist","album":"Playlist","duration":60}}"#,
+            ),
+        ]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+        backend.snapshot.playback.repeat = RepeatMode::All;
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: vec![
+                    TrackId::new("musicapp:persistent:T1"),
+                    TrackId::new("musicapp:persistent:T2"),
+                ],
+                selected_index: 1,
+                complete: true,
+            })
+            .await
+            .expect("start final track");
+
+        backend
+            .execute(BackendCommand::Next)
+            .await
+            .expect("manual repeat-all advance");
+        assert_eq!(
+            backend
+                .snapshot
+                .playback
+                .current_track
+                .expect("wrapped track")
+                .id,
+            TrackId::new("musicapp:persistent:T1")
+        );
+    }
+
+    #[test]
+    fn session_next_index_centralizes_repeat_off_one_and_all() {
+        let tracks = ["A", "B", "C"]
+            .into_iter()
+            .enumerate()
+            .map(|(source_index, id)| SessionTrack {
+                id: TrackId::new(format!("musicapp:persistent:{id}")),
+                selector: TrackSelector::PersistentId(id.to_owned()),
+                source_index,
+            })
+            .collect();
+        let session = PlaybackSession {
+            source: PlaybackSessionSource::Playlist {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                complete: true,
+                known_source_len: 3,
+            },
+            tracks,
+            index: 2,
+            repeat_mode: RepeatMode::Off,
+            shuffle_enabled: false,
+            shuffle_seed: None,
+            transition: None,
+            waiting_for_more: false,
+        };
+        assert_eq!(session.next_index(RepeatMode::Off), None);
+        assert_eq!(session.next_index(RepeatMode::One), Some(2));
+        assert_eq!(session.next_index(RepeatMode::All), Some(0));
+    }
+
+    #[test]
+    fn repeat_all_wraps_album_and_preserves_the_existing_shuffled_session_order() {
+        let tracks = ["A", "C", "B"]
+            .into_iter()
+            .enumerate()
+            .map(|(source_index, id)| SessionTrack {
+                id: TrackId::new(format!("musicapp:persistent:{id}")),
+                selector: TrackSelector::PersistentId(id.to_owned()),
+                source_index,
+            })
+            .collect::<Vec<_>>();
+        let session = PlaybackSession {
+            source: PlaybackSessionSource::Album {
+                album_id: AlbumId::new("album"),
+            },
+            tracks: tracks.clone(),
+            index: 2,
+            repeat_mode: RepeatMode::All,
+            shuffle_enabled: true,
+            shuffle_seed: Some(7),
+            transition: None,
+            waiting_for_more: false,
+        };
+        assert_eq!(session.next_index(session.repeat_mode), Some(0));
+        assert_eq!(
+            session.tracks, tracks,
+            "repeat must not reshuffle the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn cycling_repeat_during_a_session_is_local_and_keeps_native_repeat_off() {
+        let runner = Arc::new(TransitionRecordingRunner::new());
+        let runner_for_backend: Arc<dyn AutomationRunner> = runner.clone();
+        let mut backend = MacOsMusicBackend::with_runner(runner_for_backend, true);
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: ["A", "B"]
+                    .into_iter()
+                    .map(|id| TrackId::new(format!("musicapp:persistent:{id}")))
+                    .collect(),
+                selected_index: 0,
+                complete: true,
+            })
+            .await
+            .expect("start playlist session");
+
+        backend
+            .execute(BackendCommand::CycleRepeat)
+            .await
+            .expect("cycle logical repeat");
+        assert_eq!(backend.snapshot.playback.repeat, RepeatMode::All);
+        assert_eq!(
+            backend
+                .playback_session
+                .as_ref()
+                .expect("session")
+                .repeat_mode,
+            RepeatMode::All
+        );
+        assert!(
+            !runner
+                .requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .any(|request| matches!(request, ScriptRequest::CycleRepeat)),
+            "active sessions must not delegate repeat cycling to Music.app"
+        );
     }
 
     #[tokio::test]
@@ -2753,7 +3040,7 @@ mod tests {
                     .map(|track| track.id.clone())
                     .collect::<Vec<_>>(),
                 session
-                    .next_index(backend.snapshot.playback.repeat)
+                    .next_index(session.repeat_mode)
                     .expect("shuffled successor"),
             )
         };

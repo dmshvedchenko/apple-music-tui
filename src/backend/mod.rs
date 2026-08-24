@@ -4,6 +4,7 @@ pub mod mock;
 
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -22,6 +23,8 @@ use self::capabilities::{Capabilities, Capability};
 pub enum BackendCommand {
     /// Starts a new bounded authoritative Music.app library scan when no scan is active.
     RefreshLibrary,
+    /// Adds explicitly chosen local audio files to the local Music.app library.
+    ImportFiles(Vec<PathBuf>),
     OpenPlayer,
     Play,
     Pause,
@@ -106,6 +109,7 @@ const fn command_priority(command: &BackendCommand) -> CommandPriority {
         }
         BackendCommand::LoadTrackArtwork { .. } => CommandPriority::Normal,
         BackendCommand::RefreshLibrary
+        | BackendCommand::ImportFiles(_)
         | BackendCommand::OpenPlayer
         | BackendCommand::ToggleFavoriteCurrent
         | BackendCommand::Enqueue(_)
@@ -217,6 +221,19 @@ pub enum BackendUpdate {
         availability: BackendAvailability,
         playback: PlaybackSnapshot,
         playlists: Vec<Playlist>,
+        /// A user-requested scan invalidates completed in-memory playlist contents so lazy
+        /// detail loading observes external Music.app changes rather than stale process state.
+        invalidate_contents: bool,
+    },
+    ImportCompleted {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        imported: usize,
+    },
+    ImportFailed {
+        availability: BackendAvailability,
+        playback: PlaybackSnapshot,
+        message: String,
     },
     LibraryBatch {
         availability: BackendAvailability,

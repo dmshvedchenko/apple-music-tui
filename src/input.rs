@@ -55,6 +55,7 @@ enum BindingAction {
     Quit,
     OpenNowPlaying,
     RefreshLibrary,
+    ImportFiles,
     OpenPlayer,
     MoveUp,
     MoveDown,
@@ -97,6 +98,7 @@ impl BindingAction {
             Self::Quit => Some(Action::Quit),
             Self::OpenNowPlaying => Some(Action::OpenNowPlaying),
             Self::RefreshLibrary => Some(Action::RefreshLibrary),
+            Self::ImportFiles => Some(Action::ImportFiles),
             Self::OpenPlayer => Some(Action::OpenPlayer),
             Self::MoveUp => Some(Action::MoveUp),
             Self::MoveDown => Some(Action::MoveDown),
@@ -325,6 +327,13 @@ const BINDINGS: &[KeyBinding] = &[
         action: BindingAction::RefreshLibrary,
     },
     KeyBinding {
+        keys: "I",
+        description: "import local audio files",
+        group: BindingGroup::Navigation,
+        matches: &[KeyMatch::Character('I')],
+        action: BindingAction::ImportFiles,
+    },
+    KeyBinding {
         keys: "S",
         description: "sort current library view",
         group: BindingGroup::Navigation,
@@ -496,6 +505,10 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)),
             Some(Action::RefreshLibrary)
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT)),
+            Some(Action::ImportFiles)
         );
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),

@@ -39,6 +39,7 @@ pub async fn run<B: MusicBackend>(
     let (command_sender, command_receiver) = mpsc::channel(32);
     let (backend_sender, mut backend_receiver) = mpsc::channel(32);
     let (artwork_sender, mut artwork_receiver) = mpsc::channel(8);
+    let (import_sender, mut import_receiver) = mpsc::channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancellation = InputCancellation(Arc::clone(&cancelled));
 
@@ -94,6 +95,7 @@ pub async fn run<B: MusicBackend>(
                 }
             }
             artwork_event = artwork_receiver.recv() => artwork_event,
+            import_event = import_receiver.recv() => import_event,
         };
 
         if let Some(action) = action {
@@ -114,6 +116,21 @@ pub async fn run<B: MusicBackend>(
                             state.notification =
                                 Some("Backend worker stopped unexpectedly".to_owned());
                         }
+                    }
+                    Command::ChooseImportFiles => {
+                        let sender = import_sender.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = match crate::backend::macos::choose_audio_files() {
+                                Ok(crate::backend::macos::FilePickerResult::Cancelled) => {
+                                    Ok(Vec::new())
+                                }
+                                Ok(crate::backend::macos::FilePickerResult::Selected(paths)) => {
+                                    Ok(paths)
+                                }
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = sender.blocking_send(Action::ImportFilesSelected(result));
+                        });
                     }
                     Command::ConvertArtwork {
                         key,

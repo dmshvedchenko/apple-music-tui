@@ -31,6 +31,8 @@ pub struct RawMusicState {
     #[serde(default)]
     pub session_advanced: bool,
     #[serde(default)]
+    pub imported_count: Option<usize>,
+    #[serde(default)]
     pub error: Option<RawScriptError>,
 }
 

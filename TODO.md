@@ -77,6 +77,7 @@ The feature matrix is the source of truth for Apple capability assumptions. Item
 - [x] Persist a versioned, atomic last-known local library/playlist-metadata cache; hydrate derived views/search immediately and reconcile it against each authoritative progressive Music.app scan without persisting playback, sessions, or artwork.
 - [ ] Evaluate legitimate plain-lyrics reads without blocking collection loading.
 - [x] Implement removal of one selected entry from an editable user playlist with confirmation, stable playlist ID plus occurrence validation, and no library-track deletion.
+- [x] Refresh open playlist details authoritatively after external Music.app changes and add safe local-library audio import through the native file picker; playlist-targeted import remains intentionally unavailable.
 - [ ] Implement any additional playlist/favorite/rating mutation only after confirmation UI, editability/source checks, rollback/error handling, and dedicated live tests.
 - [ ] Keep Up Next, Play Next/Later, queue removal, and reorder unavailable unless a documented public Music.app surface appears.
 

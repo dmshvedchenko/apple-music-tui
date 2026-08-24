@@ -8,6 +8,9 @@ pub enum TrackSelector {
 pub enum ScriptRequest {
     FullState,
     Poll,
+    /// Poll an active synthesized session while preventing Music.app native repeat from
+    /// independently restarting an exact `once` track.
+    PollSession,
     PollPlaylistTransition {
         playlist_persistent_id: String,
         expected: TrackSelector,
@@ -32,6 +35,7 @@ pub enum ScriptRequest {
         total: Option<usize>,
     },
     OpenPlayer,
+    ImportFiles(Vec<String>),
     Play,
     Pause,
     Stop,
@@ -62,7 +66,10 @@ pub enum ScriptRequest {
 
 impl ScriptRequest {
     const fn includes_favorite(&self) -> bool {
-        !matches!(self, Self::Poll | Self::PollPlaylistTransition { .. })
+        !matches!(
+            self,
+            Self::Poll | Self::PollSession | Self::PollPlaylistTransition { .. }
+        )
     }
 
     fn operation(&self) -> String {
@@ -72,6 +79,7 @@ impl ScriptRequest {
             | Self::DiscoverPlaylists
             | Self::LibraryBatch { .. }
             | Self::PlaylistBatch { .. } => String::new(),
+            Self::PollSession => "music.songRepeat = 'off';".to_owned(),
             Self::PollPlaylistTransition {
                 playlist_persistent_id,
                 expected,
@@ -85,7 +93,8 @@ impl ScriptRequest {
                 let expected_is_persistent = expected_property == "persistentID";
                 let target_value = js_string(target_value);
                 format!(
-                    "const transitionDeadline = Date.now() + {max_wait_ms};\n\
+                    "music.songRepeat = 'off';\n\
+                     const transitionDeadline = Date.now() + {max_wait_ms};\n\
                      const initialTransitionState = String(music.playerState());\n\
                      const initialTransitionTrack = music.currentTrack;\n\
                      const initialPersistentId = readIdentifier(() => initialTransitionTrack.persistentID());\n\
@@ -121,6 +130,16 @@ impl ScriptRequest {
             #[cfg(test)]
             Self::ProfileLibraryBatch { .. } => String::new(),
             Self::OpenPlayer => "music.activate();".to_owned(),
+            Self::ImportFiles(paths) => {
+                let paths = serde_json::to_string(paths)
+                    .expect("serializing import paths to JSON cannot fail");
+                format!(
+                    "const importPaths = {paths};\n\
+                     if (importPaths.length === 0) throw new Error('No audio files were selected');\n\
+                     const importedTracks = music.add(importPaths.map((path) => Path(path)));\n\
+                     result.importedCount = Array.isArray(importedTracks) ? importedTracks.length : importPaths.length;"
+                )
+            }
             Self::Play => "music.play();".to_owned(),
             Self::Pause => "music.pause();".to_owned(),
             Self::Stop => "music.stop();".to_owned(),
@@ -144,7 +163,8 @@ impl ScriptRequest {
                 };
                 let value = js_string(value);
                 format!(
-                    "const selectedTracks = music.libraryPlaylists()[0].tracks.whose({{{property}: {value}}})();\n\
+                    "music.songRepeat = 'off';\n\
+                     const selectedTracks = music.libraryPlaylists()[0].tracks.whose({{{property}: {value}}})();\n\
                      if (selectedTracks.length === 0) throw new Error('Selected album track is no longer available');\n\
                      music.play(selectedTracks[0], {{once: true}});"
                 )
@@ -194,7 +214,8 @@ impl ScriptRequest {
                 let playlist_persistent_id = js_string(playlist_persistent_id);
                 let value = js_string(value);
                 format!(
-                    "const selectedPlaylists = music.playlists.whose({{persistentID: {playlist_persistent_id}}})();\n\
+                    "music.songRepeat = 'off';\n\
+                     const selectedPlaylists = music.playlists.whose({{persistentID: {playlist_persistent_id}}})();\n\
                      if (selectedPlaylists.length === 0) throw new Error('Selected playlist is no longer available');\n\
                      const selectedTracks = selectedPlaylists[0].tracks.whose({{{property}: {value}}})();\n\
                      if (selectedTracks.length === 0) throw new Error('Selected track is no longer available in this playlist');\n\
@@ -613,29 +634,45 @@ mod tests {
         assert!(!removal.contains("\\\\\n"));
     }
 
+    #[test]
+    fn import_paths_are_json_encoded_and_use_music_add() {
+        let script = build_script(&ScriptRequest::ImportFiles(vec![
+            "/Users/example/Artist \"Quoted\".mp3".to_owned(),
+        ]));
+        assert!(script.contains("music.add(importPaths.map((path) => Path(path)))"));
+        assert!(script.contains(r#"\"Quoted\""#));
+        assert!(!script.contains("Artist \"Quoted\".mp3\";"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn production_removal_script_parses_without_running_it() {
         use std::process::Command;
 
-        let script = build_script(&ScriptRequest::RemovePlaylistTrack {
-            playlist_persistent_id: "PLAYLIST-123".to_owned(),
-            index: 2,
-            expected: TrackSelector::PersistentId("TRACK-456".to_owned()),
-        });
-        let probe = format!(
-            "new Function({});",
-            serde_json::to_string(&script).expect("script JSON string")
-        );
-        let output = Command::new("/usr/bin/osascript")
-            .args(["-l", "JavaScript", "-e", &probe])
-            .output()
-            .expect("run macOS JavaScript parser");
-        assert!(
-            output.status.success(),
-            "generated removal JXA did not parse: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for script in [
+            build_script(&ScriptRequest::RemovePlaylistTrack {
+                playlist_persistent_id: "PLAYLIST-123".to_owned(),
+                index: 2,
+                expected: TrackSelector::PersistentId("TRACK-456".to_owned()),
+            }),
+            build_script(&ScriptRequest::ImportFiles(vec![
+                "/tmp/local-import.mp3".to_owned(),
+            ])),
+        ] {
+            let probe = format!(
+                "new Function({});",
+                serde_json::to_string(&script).expect("script JSON string")
+            );
+            let output = Command::new("/usr/bin/osascript")
+                .args(["-l", "JavaScript", "-e", &probe])
+                .output()
+                .expect("run macOS JavaScript parser");
+            assert!(
+                output.status.success(),
+                "generated JXA did not parse: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -646,6 +683,27 @@ mod tests {
         assert!(!poll.contains("track.persistentId()"));
         assert!(poll.contains("includeFavorite = false"));
         assert!(build_script(&ScriptRequest::FullState).contains("includeFavorite = true"));
+    }
+
+    #[test]
+    fn synthesized_session_requests_disable_native_repeat() {
+        let album = build_script(&ScriptRequest::PlayTrackOnce(TrackSelector::PersistentId(
+            "A".to_owned(),
+        )));
+        let playlist = build_script(&ScriptRequest::PlayPlaylistTrackOnce {
+            playlist_persistent_id: "P".to_owned(),
+            track: TrackSelector::PersistentId("A".to_owned()),
+        });
+        let poll = build_script(&ScriptRequest::PollSession);
+        let transition = build_script(&ScriptRequest::PollPlaylistTransition {
+            playlist_persistent_id: "P".to_owned(),
+            expected: TrackSelector::PersistentId("A".to_owned()),
+            target: TrackSelector::PersistentId("B".to_owned()),
+            max_wait_ms: 1_000,
+        });
+        for script in [&album, &playlist, &poll, &transition] {
+            assert!(script.contains("music.songRepeat = 'off';"));
+        }
     }
 
     #[test]

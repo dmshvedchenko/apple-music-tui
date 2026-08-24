@@ -124,8 +124,21 @@ removes only that metadata file; a missing file is successful and no Music.app,
 configuration, artwork, or session data is touched.
 
 Playlist discovery remains authoritative. New/deleted playlists and folder
-relationships reconcile with each scan, while already completed playlist
-contents are retained for the running session rather than eagerly reloaded.
+relationships reconcile with each scan. A user-requested `R` refresh invalidates
+previously completed in-memory playlist contents; if that playlist detail is
+open, it is reloaded lazily at once, so external additions/removals become
+visible without restarting. The current selected entry is retained by stable
+track ID when it remains present.
+
+## Import local audio files
+
+`I` opens the standard macOS file picker and imports selected supported audio
+files into the Music.app library through the public `add` scripting command—the
+same library-level intent as Music.app's Add to Library command. The picker runs
+outside the serialized Music.app worker; the import itself is validated and then
+uses that worker. A successful import starts an authoritative refresh, without
+changing playback or a synthesized PlaybackSession. Importing into a playlist is
+intentionally not implied or exposed.
 
 ## Full-screen Now Playing
 

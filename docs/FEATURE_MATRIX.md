@@ -31,6 +31,7 @@ items are candidates, not published capabilities.
 | Local library search | `SUPPORTED` | Immediate normalized in-memory search over cached/refreshing tracks, albums, artists, and playlists | Maintain locally |
 | Catalog search | `REQUIRES_APPLE_API` | No local catalog query surface | Apple Music API |
 | Songs | `SUPPORTED` | Progressive authoritative scan, last-known cache, stable IDs, cloud/local tracks | Maintain locally |
+| Import local audio files | `SUPPORTED` | Native macOS file picker plus documented Music.app `add(files)` imports into Library and starts an authoritative refresh | Library-only; do not imply playlist mutation |
 | Artists and Albums | `PARTIAL` | Correctly derived from track metadata rather than first-class Music.app collections | Local sorting/filtering/metadata |
 | Recently Added | `LOCAL_ONLY` | Derived from local `dateAdded`, not an Apple cloud endpoint | Maintain locally |
 | Recently Played / History | `PARTIAL` | Local `playedDate`/count is useful, but is not a complete event history | API needed for cloud history parity |
@@ -82,6 +83,7 @@ Local statuses are stricter than dictionary availability:
 | Playlist folders | Folder class and parent relationships worked live, including nested children | Stable-ID hierarchy with distinct folder rows, indentation, and expand/collapse | `SUPPORTED` |
 | Smart playlists | User-playlist `smart` flag and contents are readable | Classified and readable; rules are never reverse-engineered or edited | `READ_ONLY` |
 | Playlist contents | Track object specifiers worked; some concrete playlists require selected-property fallback | Explicit per-playlist loading/partial/loaded/empty/error state, foreground bounded batches, and a 20-item fallback cap | `SUPPORTED` |
+| Import local audio files | `add` accepts a file list and optional playlist location in the public Music.app dictionary | Native picker + validated Library import + authoritative refresh; no automatic playlist target | `SUPPORTED` |
 | Create playlist | Temporary AppleScript creation worked, but the JXA `make` path used by this backend returned `-1708`; smart creation silently produced a regular playlist | Research only; disabled | `UNAVAILABLE` |
 | Rename playlist | Temporary rename preserved persistent ID, including when duplicate display names had distinct IDs | Research only; disabled pending editability, confirmation, and rollback design | `UNAVAILABLE` |
 | Delete playlist | Deleting only test-created playlists worked immediately and displayed no Music.app confirmation | Research only; disabled; any future UI must confirm first | `UNAVAILABLE` |

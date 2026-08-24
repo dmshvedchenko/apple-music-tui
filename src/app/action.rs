@@ -2,6 +2,7 @@ use crate::{
     backend::{BackendCommand, BackendEvent},
     domain::{Artwork, ArtworkKey, TrackId},
 };
+use std::path::PathBuf;
 
 use super::state::Screen;
 
@@ -13,6 +14,8 @@ pub enum Action {
     ConfirmPlaylistTrackRemoval,
     OpenNowPlaying,
     RefreshLibrary,
+    ImportFiles,
+    ImportFilesSelected(Result<Vec<PathBuf>, String>),
     OpenPlayer,
     MoveUp,
     MoveDown,
@@ -72,6 +75,7 @@ pub enum Action {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Backend(BackendCommand),
+    ChooseImportFiles,
     ConvertArtwork {
         key: ArtworkKey,
         source_fingerprint: u64,

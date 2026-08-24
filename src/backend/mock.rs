@@ -544,6 +544,11 @@ impl MusicBackend for MockMusicBackend {
                     message: "Mock library is already ready".to_owned(),
                 });
             }
+            BackendCommand::ImportFiles(_) => {
+                return Err(BackendError::Unsupported(
+                    crate::backend::capabilities::Capability::LibraryImport,
+                ));
+            }
             BackendCommand::OpenPlayer => {
                 return Err(BackendError::Unsupported(
                     crate::backend::capabilities::Capability::Launch,

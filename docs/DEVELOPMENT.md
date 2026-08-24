@@ -170,7 +170,7 @@ events, retains its cached/visible source collections and runtime sort/filter
 views, and accepts progressive stable-ID reconciliation exactly as at startup.
 Repeated requests while discovery or scanning is active return a notice instead
 of launching a second scan. Completed playlist contents remain session-cached
-when playlist metadata/hierarchy is reconciled.
+until a user-requested authoritative refresh invalidates them for reconciliation.
 
 **Rationale:** A second full scan would compete with bounded Apple Events and
 would make status misleading. Reusing the established background phase keeps
@@ -202,6 +202,12 @@ new automation work in the render path.
 **Decision:** Keep one serialized Music.app automation executor, but classify queued commands as interactive, high, normal, or low. Direct transport/selection commands run before foreground playlist loads, polling/artwork, and refresh work once the current Apple Event returns; after eight foreground operations one low-priority request runs. Coalesce duplicate refresh, playlist-load, and artwork requests. Fetch 40 playlist rows for the initial response and 200 thereafter; detach cache serialization from the automation worker. DEBUG telemetry records input-to-dispatch, queue wait, command, osascript-spawn/process, playlist-batch, and cache-write timings.
 
 **Rationale:** FIFO command handling could place Space or selected-track playback behind already-queued refresh work. A running Apple Event cannot be safely interrupted, so priority takes effect at request boundaries without introducing concurrent Music.app mutations. The first 40 rows make Playlist Detail usable sooner; subsequent 200-row requests avoid turning a large playlist into many tiny Apple Events. Cache disk I/O is unrelated to Music.app authority and must not occupy the sole interactive executor.
+
+## D034 — Manual refresh invalidates process-cached playlist contents; local import uses public `add`
+
+**Decision:** A completed user-requested library refresh replaces playlist metadata and invalidates completed in-memory playlist contents, then immediately lazy-loads an already open Playlist Detail. The reducer retains that detail's selection by stable track ID while its fresh batches arrive. Local file import uses the documented Music.app `add` command after the standard macOS file picker returns selected audio paths; import triggers the same authoritative refresh and never restores or changes a PlaybackSession.
+
+**Rationale:** Retaining process-cached completed playlist contents after an authoritative `R` scan hid external Music.app additions/removals until restart. The installed Music.app scripting definition documents `add` with a list of files and an optional destination; using it for Library import provides Cmd+O-equivalent intent without exposing playlist writes or relying on private APIs.
 
 ## D023 — Selected playlist-track playback is a synthesized stable-ID session
 

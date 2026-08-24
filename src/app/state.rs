@@ -336,6 +336,8 @@ pub struct AppState {
     pub recently_played: Vec<RecentlyPlayedEntry>,
     pub stations: Vec<Station>,
     pub playlists: Vec<Playlist>,
+    /// Selected playlist entry retained across an authoritative detail reload by stable ID.
+    pub pending_playlist_selection: Option<(PlaylistId, crate::domain::TrackId)>,
     pub playlist_hierarchy: PlaylistHierarchy,
     pub expanded_playlist_folders: BTreeSet<PlaylistId>,
     pub artwork_cache: BTreeMap<ArtworkKey, ArtworkCacheEntry>,
@@ -365,6 +367,7 @@ pub struct AppState {
     pub action_menu: Option<ActionMenuState>,
     pub playlist_track_removal_confirmation: Option<PlaylistTrackRemovalConfirmation>,
     pub playlist_track_removal_in_flight: bool,
+    pub import_in_flight: bool,
     pub terminal_size: (u16, u16),
 }
 
@@ -387,6 +390,7 @@ impl Default for AppState {
             recently_played: Vec::new(),
             stations: Vec::new(),
             playlists: Vec::new(),
+            pending_playlist_selection: None,
             playlist_hierarchy: PlaylistHierarchy::default(),
             expanded_playlist_folders: BTreeSet::new(),
             artwork_cache: BTreeMap::new(),
@@ -415,6 +419,7 @@ impl Default for AppState {
             action_menu: None,
             playlist_track_removal_confirmation: None,
             playlist_track_removal_in_flight: false,
+            import_in_flight: false,
             terminal_size: (80, 24),
         }
     }

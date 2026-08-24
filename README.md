@@ -29,6 +29,7 @@ If you enjoy tools like **lazygit**, **k9s**, **btop**, or **yazi**, the interfa
 - 🔎 Search, sorting and filtering
 - 📂 Playlist and album playback
 - ⚡ Fast metadata cache with background refresh
+- 📥 Import local audio files into Music.app
 - ⌨ Keyboard-driven workflow
 - 🍺 Homebrew installation
 
@@ -234,6 +235,7 @@ The underlying library track is never deleted.
 | `s`     | Toggle shuffle                |
 | `r`     | Toggle repeat                 |
 | `R`     | Refresh library               |
+| `I`     | Import local audio files      |
 | `/`     | Search                        |
 | `S`     | Sort                          |
 | `F`     | Filter                        |

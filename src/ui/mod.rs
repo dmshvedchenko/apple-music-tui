@@ -268,14 +268,12 @@ fn full_now_playing_status(state: &AppState, track: &Track, width: u16) -> Strin
         RepeatMode::One => "one",
     };
     let mut fields = vec![
-        format!(
-            "{}",
-            match state.playback.status {
-                PlaybackStatus::Playing => "Playing",
-                PlaybackStatus::Paused => "Paused",
-                PlaybackStatus::Stopped => "Stopped",
-            }
-        ),
+        (match state.playback.status {
+            PlaybackStatus::Playing => "Playing",
+            PlaybackStatus::Paused => "Paused",
+            PlaybackStatus::Stopped => "Stopped",
+        })
+        .to_owned(),
         format!("vol {}%", state.playback.volume),
         format!(
             "shuffle {}",

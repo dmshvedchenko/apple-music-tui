@@ -1,4 +1,6 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
+
+use serde::Deserialize;
 
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -15,6 +17,34 @@ pub trait AutomationRunner: Send + Sync {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemAutomationRunner;
+
+/// Result of the native file picker used before importing local audio into Music.app.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FilePickerResult {
+    Cancelled,
+    Selected(Vec<PathBuf>),
+}
+
+#[derive(Deserialize)]
+struct FilePickerResponse {
+    cancelled: bool,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// Opens the standard macOS file picker without occupying the serialized Music.app worker.
+pub fn choose_audio_files() -> Result<FilePickerResult, AutomationError> {
+    let output = run_osascript(FILE_PICKER_SCRIPT)?;
+    let response: FilePickerResponse = serde_json::from_str(output.trim())
+        .map_err(|error| AutomationError::PickerResponse(error.to_string()))?;
+    if response.cancelled {
+        Ok(FilePickerResult::Cancelled)
+    } else {
+        Ok(FilePickerResult::Selected(
+            response.paths.into_iter().map(PathBuf::from).collect(),
+        ))
+    }
+}
 
 impl AutomationRunner for SystemAutomationRunner {
     fn is_installed(&self) -> bool {
@@ -35,9 +65,13 @@ pub enum AutomationError {
     #[cfg(target_os = "macos")]
     Timeout,
     #[cfg(target_os = "macos")]
-    Failed { code: Option<i32>, stderr: String },
+    Failed {
+        code: Option<i32>,
+        stderr: String,
+    },
     #[cfg(target_os = "macos")]
     InvalidUtf8,
+    PickerResponse(String),
 }
 
 impl fmt::Display for AutomationError {
@@ -55,9 +89,34 @@ impl fmt::Display for AutomationError {
             }
             #[cfg(target_os = "macos")]
             Self::InvalidUtf8 => formatter.write_str("osascript returned non-UTF-8 output"),
+            Self::PickerResponse(message) => {
+                write!(
+                    formatter,
+                    "native file picker returned invalid data: {message}"
+                )
+            }
         }
     }
 }
+
+const FILE_PICKER_SCRIPT: &str = r#"(() => {
+const app = Application.currentApplication();
+app.includeStandardAdditions = true;
+try {
+    const selected = app.chooseFile({
+        withPrompt: "Import audio files into Music",
+        multipleSelectionsAllowed: true,
+        ofType: ["public.audio"]
+    });
+    const paths = (Array.isArray(selected) ? selected : [selected]).map((file) => String(file));
+    return JSON.stringify({ cancelled: false, paths });
+} catch (error) {
+    if (Number(error.errorNumber) === -128) {
+        return JSON.stringify({ cancelled: true, paths: [] });
+    }
+    throw error;
+}
+})();"#;
 
 #[cfg(target_os = "macos")]
 fn music_app_is_installed() -> bool {
@@ -156,11 +215,30 @@ fn run_osascript(_script: &str) -> Result<String, AutomationError> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{AutomationRunner, SystemAutomationRunner};
+    use std::process::Command;
+
+    use super::{AutomationRunner, FILE_PICKER_SCRIPT, SystemAutomationRunner};
     use crate::backend::macos::{
         parser::parse_output,
         script::{ScriptRequest, build_script},
     };
+
+    #[test]
+    fn native_file_picker_script_parses_without_opening_a_dialog() {
+        let probe = format!(
+            "new Function({});",
+            serde_json::to_string(FILE_PICKER_SCRIPT).expect("serialize picker script")
+        );
+        let output = Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", &probe])
+            .output()
+            .expect("run macOS JavaScript parser");
+        assert!(
+            output.status.success(),
+            "native picker JXA did not parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     #[ignore = "requires a running local Music.app and Automation consent"]

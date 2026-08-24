@@ -203,6 +203,34 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Command> {
         Action::RefreshLibrary => {
             return vec![Command::Backend(BackendCommand::RefreshLibrary)];
         }
+        Action::ImportFiles => {
+            if state.import_in_flight {
+                state.notification = Some("An import is already in progress".to_owned());
+                return Vec::new();
+            }
+            if !state.capabilities.supports(Capability::LibraryImport) {
+                state.notification =
+                    Some("Active backend does not support local file import".to_owned());
+                return Vec::new();
+            }
+            state.import_in_flight = true;
+            state.notification = Some("Choose audio files to import…".to_owned());
+            return vec![Command::ChooseImportFiles];
+        }
+        Action::ImportFilesSelected(result) => match result {
+            Ok(paths) if paths.is_empty() => {
+                state.import_in_flight = false;
+                state.notification = Some("Import cancelled".to_owned());
+            }
+            Ok(paths) => {
+                state.notification = Some(format!("Importing {} file(s)…", paths.len()));
+                return vec![Command::Backend(BackendCommand::ImportFiles(paths))];
+            }
+            Err(message) => {
+                state.import_in_flight = false;
+                state.notification = Some(format!("Import failed: {message}"));
+            }
+        },
         Action::OpenPlayer => {
             return backend_command(state, Capability::Launch, BackendCommand::OpenPlayer);
         }
@@ -1660,6 +1688,28 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             };
             state.notification = Some("Refreshing library…".to_owned());
         }
+        BackendEvent::Update(BackendUpdate::ImportCompleted {
+            availability,
+            playback,
+            imported,
+        }) => {
+            state.import_in_flight = false;
+            apply_playback_update(state, availability, playback);
+            state.library_status = crate::domain::CollectionLoadState::Refreshing {
+                loaded: 0,
+                total: 0,
+            };
+            state.notification = Some(format!("Imported {imported} file(s); refreshing library…"));
+        }
+        BackendEvent::Update(BackendUpdate::ImportFailed {
+            availability,
+            playback,
+            message,
+        }) => {
+            state.import_in_flight = false;
+            apply_playback_update(state, availability, playback);
+            state.notification = Some(format!("Import failed: {message}"));
+        }
         BackendEvent::Update(BackendUpdate::LibraryRefreshFailed {
             availability,
             playback,
@@ -1687,7 +1737,7 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             state.recently_added = snapshot.recently_added;
             state.recently_played = snapshot.recently_played;
             state.stations = snapshot.stations;
-            replace_playlists(state, snapshot.playlists);
+            replace_playlists(state, snapshot.playlists, false);
             state.library_status = snapshot.library_status;
             state.playlist_status = snapshot.playlist_status;
             rebuild_search_index(state);
@@ -1716,7 +1766,7 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             state.recently_added = snapshot.recently_added;
             state.recently_played = snapshot.recently_played;
             state.stations = snapshot.stations;
-            replace_playlists(state, snapshot.playlists);
+            replace_playlists(state, snapshot.playlists, false);
             state.library_status = snapshot.library_status;
             state.playlist_status = snapshot.playlist_status;
             rebuild_search_index(state);
@@ -1749,9 +1799,10 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             availability,
             playback,
             playlists,
+            invalidate_contents,
         }) => {
             apply_playback_update(state, availability, playback);
-            replace_playlists(state, playlists);
+            replace_playlists(state, playlists, invalidate_contents);
             state.view_status = ViewStatus::Loaded;
             state.playlist_status = crate::domain::CollectionLoadState::Loaded {
                 total: state.playlists.len(),
@@ -1769,6 +1820,18 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
             rebuild_search_index(state);
             refresh_search(state);
             clamp_selections(state);
+            if invalidate_contents
+                && let Route::PlaylistDetail { playlist_id } = &state.navigation.active
+                && state
+                    .playlists
+                    .iter()
+                    .any(|playlist| playlist.id == *playlist_id)
+                && state.capabilities.supports(Capability::PlaylistRead)
+            {
+                commands.push(Command::Backend(BackendCommand::LoadPlaylist(
+                    playlist_id.clone(),
+                )));
+            }
         }
         BackendEvent::Update(BackendUpdate::LibraryBatch {
             availability,
@@ -1893,6 +1956,7 @@ fn apply_backend_event(state: &mut AppState, event: BackendEvent) -> Vec<Command
                     PlaylistLoadState::PartiallyLoaded { loaded, total }
                 };
             }
+            restore_refreshed_playlist_selection(state, &playlist_id, complete);
             clamp_selections(state);
         }
         BackendEvent::Update(BackendUpdate::PlaylistLoadFailed {
@@ -2276,9 +2340,26 @@ fn toggle_playlist_folder(state: &mut AppState, playlist_id: PlaylistId) {
     }
 }
 
-fn replace_playlists(state: &mut AppState, playlists: Vec<crate::domain::Playlist>) {
+fn replace_playlists(
+    state: &mut AppState,
+    playlists: Vec<crate::domain::Playlist>,
+    invalidate_contents: bool,
+) {
     let selected_id = if matches!(state.navigation.active, Route::Section(Screen::Playlists)) {
         selected_playlist_id(state)
+    } else {
+        None
+    };
+    let selected_detail_track = if invalidate_contents {
+        match &state.navigation.active {
+            Route::PlaylistDetail { playlist_id } => state
+                .playlists
+                .iter()
+                .find(|playlist| playlist.id == *playlist_id)
+                .and_then(|playlist| playlist.tracks.get(state.content_selection))
+                .map(|track| (playlist_id.clone(), track.id.clone())),
+            _ => None,
+        }
     } else {
         None
     };
@@ -2290,6 +2371,7 @@ fn replace_playlists(state: &mut AppState, playlists: Vec<crate::domain::Playlis
                 .iter()
                 .find(|existing| existing.id == playlist.id)
                 && previous.contents_state.is_complete()
+                && !invalidate_contents
             {
                 playlist.tracks = previous.tracks.clone();
                 playlist.contents_state = previous.contents_state.clone();
@@ -2297,6 +2379,9 @@ fn replace_playlists(state: &mut AppState, playlists: Vec<crate::domain::Playlis
             playlist
         })
         .collect();
+    if invalidate_contents {
+        state.pending_playlist_selection = selected_detail_track;
+    }
     state.playlist_hierarchy = PlaylistHierarchy::from_playlists(&state.playlists);
     let folder_ids = state
         .playlists
@@ -2313,6 +2398,35 @@ fn replace_playlists(state: &mut AppState, playlists: Vec<crate::domain::Playlis
             .position(|entry| entry.playlist_id == selected_id)
     {
         state.content_selection = index;
+    }
+}
+
+fn restore_refreshed_playlist_selection(
+    state: &mut AppState,
+    playlist_id: &PlaylistId,
+    complete: bool,
+) {
+    let Some((pending_playlist_id, track_id)) = state.pending_playlist_selection.as_ref() else {
+        return;
+    };
+    if pending_playlist_id != playlist_id {
+        return;
+    }
+    let position = state
+        .playlists
+        .iter()
+        .find(|playlist| playlist.id == *playlist_id)
+        .and_then(|playlist| {
+            playlist
+                .tracks
+                .iter()
+                .position(|track| track.id == *track_id)
+        });
+    if let Some(position) = position {
+        state.content_selection = position;
+        state.pending_playlist_selection = None;
+    } else if complete {
+        state.pending_playlist_selection = None;
     }
 }
 
@@ -2447,7 +2561,7 @@ fn clamp_selections(state: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use crate::{
         app::{
@@ -3769,6 +3883,226 @@ mod tests {
         ));
         assert_eq!(state.library.len(), 2);
         assert_eq!(state.library_views.songs.filter, "artist");
+    }
+
+    #[test]
+    fn authoritative_refresh_reloads_open_playlist_and_retains_selected_stable_track() {
+        let playlist_id = PlaylistId::new("musicapp:playlist:persistent:P");
+        let first = Track::new(
+            "musicapp:persistent:A",
+            "A",
+            "Artist",
+            "Album",
+            Duration::from_secs(1),
+        );
+        let selected = Track::new(
+            "musicapp:persistent:B",
+            "B",
+            "Artist",
+            "Album",
+            Duration::from_secs(1),
+        );
+        let mut state = AppState {
+            navigation: crate::app::state::NavigationState {
+                active: Route::PlaylistDetail {
+                    playlist_id: playlist_id.clone(),
+                },
+                history: Vec::new(),
+            },
+            content_selection: 1,
+            capabilities: Capabilities::macos(),
+            playlists: vec![Playlist::new(
+                playlist_id.to_string(),
+                "Before refresh",
+                None,
+                vec![first, selected.clone()],
+            )],
+            ..AppState::default()
+        };
+
+        let commands = reduce(
+            &mut state,
+            Action::Backend(Box::new(BackendEvent::Update(BackendUpdate::Playlists {
+                availability: crate::domain::BackendAvailability::Available,
+                playback: PlaybackSnapshot::default(),
+                playlists: vec![Playlist::unloaded(
+                    playlist_id.to_string(),
+                    "After refresh",
+                    Some("changed metadata".to_owned()),
+                    PlaylistKind::User,
+                    None,
+                )],
+                invalidate_contents: true,
+            }))),
+        );
+        assert_eq!(
+            commands,
+            vec![Command::Backend(BackendCommand::LoadPlaylist(
+                playlist_id.clone()
+            ))]
+        );
+        assert!(state.playlists[0].tracks.is_empty());
+        assert_eq!(state.playlists[0].name, "After refresh");
+
+        let fresh = Track::new(
+            "musicapp:persistent:C",
+            "C",
+            "Artist",
+            "Album",
+            Duration::from_secs(1),
+        );
+        reduce(
+            &mut state,
+            Action::Backend(Box::new(BackendEvent::Update(
+                BackendUpdate::PlaylistBatch {
+                    availability: crate::domain::BackendAvailability::Available,
+                    playback: PlaybackSnapshot::default(),
+                    playlist_id: playlist_id.clone(),
+                    tracks: vec![fresh, selected],
+                    loaded: 2,
+                    total: 2,
+                    complete: true,
+                },
+            ))),
+        );
+        assert_eq!(
+            state.playlists[0].tracks.len(),
+            2,
+            "stale entries must be removed"
+        );
+        assert_eq!(
+            state.playlists[0].tracks[0].id,
+            TrackId::new("musicapp:persistent:C")
+        );
+        assert!(state.pending_playlist_selection.is_none());
+        assert_eq!(
+            state.content_selection, 1,
+            "selection follows the stable track ID"
+        );
+    }
+
+    #[test]
+    fn authoritative_library_refresh_merges_new_ids_then_removes_stale_ids_at_completion() {
+        let cached = Track::new(
+            "musicapp:persistent:OLD",
+            "Old",
+            "Artist",
+            "Album",
+            Duration::from_secs(1),
+        );
+        let added = Track::new(
+            "musicapp:persistent:NEW",
+            "New",
+            "Artist",
+            "Album",
+            Duration::from_secs(1),
+        );
+        let mut state = AppState {
+            library: vec![cached.clone()],
+            library_status: crate::domain::CollectionLoadState::Refreshing {
+                loaded: 0,
+                total: 2,
+            },
+            ..AppState::default()
+        };
+        reduce(
+            &mut state,
+            Action::Backend(Box::new(BackendEvent::Update(
+                BackendUpdate::LibraryBatch {
+                    availability: crate::domain::BackendAvailability::Available,
+                    playback: PlaybackSnapshot::default(),
+                    tracks: vec![added.clone()],
+                    authoritative_tracks: None,
+                    loaded: 1,
+                    total: 2,
+                    complete: false,
+                    artists: Vec::new(),
+                    albums: Vec::new(),
+                    recently_added: Vec::new(),
+                    recently_played: Vec::new(),
+                },
+            ))),
+        );
+        assert_eq!(state.library.len(), 2);
+        assert!(state.library.iter().any(|track| track.id == added.id));
+
+        reduce(
+            &mut state,
+            Action::Backend(Box::new(BackendEvent::Update(
+                BackendUpdate::LibraryBatch {
+                    availability: crate::domain::BackendAvailability::Available,
+                    playback: PlaybackSnapshot::default(),
+                    tracks: Vec::new(),
+                    authoritative_tracks: Some(vec![added.clone()]),
+                    loaded: 1,
+                    total: 1,
+                    complete: true,
+                    artists: Vec::new(),
+                    albums: Vec::new(),
+                    recently_added: Vec::new(),
+                    recently_played: Vec::new(),
+                },
+            ))),
+        );
+        assert_eq!(state.library, vec![added]);
+        assert!(!state.library.iter().any(|track| track.id == cached.id));
+    }
+
+    #[test]
+    fn import_action_is_semantic_and_cancellation_preserves_playback_context() {
+        let playback = PlaybackSnapshot {
+            context: PlaybackContext::Album {
+                album_id: AlbumId::new("album"),
+                ordered_track_ids: vec![TrackId::new("musicapp:persistent:A")],
+                current_index: 0,
+            },
+            ..PlaybackSnapshot::default()
+        };
+        let mut state = AppState {
+            capabilities: Capabilities::macos(),
+            playback: playback.clone(),
+            ..AppState::default()
+        };
+        assert_eq!(
+            reduce(&mut state, Action::ImportFiles),
+            vec![Command::ChooseImportFiles]
+        );
+        reduce(&mut state, Action::ImportFilesSelected(Ok(Vec::new())));
+        assert!(!state.import_in_flight);
+        assert_eq!(state.playback, playback);
+
+        assert_eq!(
+            reduce(&mut state, Action::ImportFiles),
+            vec![Command::ChooseImportFiles]
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                Action::ImportFilesSelected(Ok(vec![PathBuf::from("/tmp/example.mp3")])),
+            ),
+            vec![Command::Backend(BackendCommand::ImportFiles(vec![
+                PathBuf::from("/tmp/example.mp3")
+            ]))]
+        );
+        assert_eq!(state.playback, playback);
+        reduce(
+            &mut state,
+            Action::Backend(Box::new(BackendEvent::Update(
+                BackendUpdate::ImportFailed {
+                    availability: crate::domain::BackendAvailability::Available,
+                    playback: playback.clone(),
+                    message: "unreadable file".to_owned(),
+                },
+            ))),
+        );
+        assert!(!state.import_in_flight);
+        assert!(
+            state
+                .notification
+                .as_deref()
+                .is_some_and(|message| message.contains("unreadable file"))
+        );
+        assert_eq!(state.playback, playback);
     }
 
     #[test]
