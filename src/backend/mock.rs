@@ -680,6 +680,9 @@ mod tests {
     async fn playback_commands_change_real_mock_state() {
         let mut backend = MockMusicBackend::new();
         assert!(backend.capabilities().supports(Capability::Playback));
+        let initial = backend.snapshot().await.expect("mock snapshot succeeds");
+        assert!(!initial.playback.shuffle);
+        assert_eq!(initial.playback.repeat, RepeatMode::All);
 
         let playing = snapshot(
             backend
@@ -782,7 +785,7 @@ mod tests {
                 .await
                 .expect("mock repeat succeeds"),
         );
-        assert_eq!(repeated.playback.repeat, RepeatMode::All);
+        assert_eq!(repeated.playback.repeat, RepeatMode::One);
     }
 
     #[tokio::test]

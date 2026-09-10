@@ -2674,6 +2674,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_playback_defaults_to_shuffle_off_and_repeat_all() {
+        let playback = PlaybackSnapshot::default();
+        assert!(!playback.shuffle);
+        assert_eq!(playback.repeat, RepeatMode::All);
+    }
+
+    #[tokio::test]
+    async fn new_synthesized_playlist_session_receives_playback_defaults() {
+        let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([(
+            ScriptRequest::PlayPlaylistTrackOnce {
+                playlist_persistent_id: "P".to_owned(),
+                track: TrackSelector::PersistentId("T1".to_owned()),
+            },
+            r#"{"running":true,"state":"playing","position":0,"volume":50,"repeat":"off","track":{"persistentId":"T1","name":"One","artist":"Artist","album":"Playlist","duration":60}}"#,
+        )]));
+        let mut backend = MacOsMusicBackend::with_runner(runner, true);
+
+        backend
+            .execute(BackendCommand::PlayPlaylistTrack {
+                playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),
+                ordered_track_ids: vec![
+                    TrackId::new("musicapp:persistent:T1"),
+                    TrackId::new("musicapp:persistent:T2"),
+                ],
+                selected_index: 0,
+                complete: true,
+            })
+            .await
+            .expect("start playlist session");
+
+        let session = backend.playback_session.as_ref().expect("session");
+        assert!(!session.shuffle_enabled);
+        assert_eq!(session.repeat_mode, RepeatMode::All);
+        assert_eq!(backend.snapshot.playback.repeat, RepeatMode::All);
+    }
+
     #[tokio::test]
     async fn manual_next_uses_the_same_repeat_all_session_transition() {
         let runner: Arc<dyn AutomationRunner> = Arc::new(SequenceRunner::new([
@@ -2787,6 +2824,7 @@ mod tests {
         let runner = Arc::new(TransitionRecordingRunner::new());
         let runner_for_backend: Arc<dyn AutomationRunner> = runner.clone();
         let mut backend = MacOsMusicBackend::with_runner(runner_for_backend, true);
+        backend.snapshot.playback.repeat = RepeatMode::Off;
         backend
             .execute(BackendCommand::PlayPlaylistTrack {
                 playlist_id: PlaylistId::new("musicapp:playlist:persistent:P"),

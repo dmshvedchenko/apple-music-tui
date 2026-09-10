@@ -74,8 +74,10 @@ impl ScriptRequest {
 
     fn operation(&self) -> String {
         match self {
-            Self::FullState
-            | Self::Poll
+            Self::FullState => {
+                "music.shuffleEnabled = false;\nmusic.songRepeat = 'all';".to_owned()
+            }
+            Self::Poll
             | Self::DiscoverPlaylists
             | Self::LibraryBatch { .. }
             | Self::PlaylistBatch { .. } => String::new(),
@@ -704,6 +706,13 @@ mod tests {
         for script in [&album, &playlist, &poll, &transition] {
             assert!(script.contains("music.songRepeat = 'off';"));
         }
+    }
+
+    #[test]
+    fn initial_full_state_applies_application_playback_defaults() {
+        let script = build_script(&ScriptRequest::FullState);
+        assert!(script.contains("music.shuffleEnabled = false;"));
+        assert!(script.contains("music.songRepeat = 'all';"));
     }
 
     #[test]

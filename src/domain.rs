@@ -670,7 +670,7 @@ impl Default for PlaybackSnapshot {
             volume: 50,
             muted: false,
             shuffle: false,
-            repeat: RepeatMode::Off,
+            repeat: RepeatMode::All,
             context: PlaybackContext::NoContext,
         }
     }
